@@ -32,50 +32,60 @@ def get_trending(
     """获取 Trending 榜单 (优先读缓存, 缓存 miss 时实时计算).
 
     - time_window: daily / weekly / monthly
-    - language: all / python / rust / ... (all 时读缓存, 其他语言实时计算)
+    - language: all / python / rust / ... (all 与热门语言读缓存, 其他语言实时计算)
     - limit: 返回数量 (最大 1000)
     - page: 页码
     """
-    # language=all 时优先读缓存
-    if language == "all":
-        # 用 count + offset/limit 在 SQL 层分页, 避免把全部缓存行读入内存
-        total = (
-            db.query(func.count(TrendingCache.id))
-            .filter(TrendingCache.time_window == time_window)
-            .scalar()
-        ) or 0
-        if total > 0:
-            page_rows = (
-                db.query(TrendingCache, Repository)
-                .join(Repository, Repository.id == TrendingCache.repository_id)
-                .filter(TrendingCache.time_window == time_window)
-                .order_by(TrendingCache.rank.asc())
-                .offset((page - 1) * limit)
-                .limit(limit)
-                .all()
-            )
-            items = [
-                TrendingItemOut(
-                    rank=cache.rank,
-                    repo=RepositoryOut.model_validate(repo),
-                    delta_stars=cache.delta_stars,
-                    score=cache.score,
-                )
-                for cache, repo in page_rows
-            ]
-            return TrendingListOut(
-                time_window=time_window,
-                language=language,
-                total=total,
-                page=page,
-                limit=limit,
-                items=items,
-                cache_hit=True,
-            )
-        # 缓存 miss: 降级到实时计算
-        logger.info("Trending cache miss for time_window=%s, computing in real-time", time_window)
+    # 缓存语言键: all 直接用, 其他语言小写化 (与 _rebuild_trending_cache 存储一致)
+    cache_lang = "all" if language == "all" else language.lower()
 
-    # 实时计算 (缓存 miss 或指定语言时)
+    # 优先读缓存 (all + 热门语言均有预计算缓存)
+    total = (
+        db.query(func.count(TrendingCache.id))
+        .filter(
+            TrendingCache.time_window == time_window,
+            TrendingCache.language == cache_lang,
+        )
+        .scalar()
+    ) or 0
+    if total > 0:
+        page_rows = (
+            db.query(TrendingCache, Repository)
+            .join(Repository, Repository.id == TrendingCache.repository_id)
+            .filter(
+                TrendingCache.time_window == time_window,
+                TrendingCache.language == cache_lang,
+            )
+            .order_by(TrendingCache.rank.asc())
+            .offset((page - 1) * limit)
+            .limit(limit)
+            .all()
+        )
+        items = [
+            TrendingItemOut(
+                rank=cache.rank,
+                repo=RepositoryOut.model_validate(repo),
+                delta_stars=cache.delta_stars,
+                score=cache.score,
+            )
+            for cache, repo in page_rows
+        ]
+        return TrendingListOut(
+            time_window=time_window,
+            language=language,
+            total=total,
+            page=page,
+            limit=limit,
+            items=items,
+            cache_hit=True,
+        )
+    # 缓存 miss: 降级到实时计算
+    logger.info(
+        "Trending cache miss for time_window=%s language=%s, computing in real-time",
+        time_window, language,
+    )
+
+    # 实时计算 (缓存 miss 时)
     latest_date_subq = (
         db.query(
             Snapshot.repository_id.label("rid"),
@@ -96,7 +106,7 @@ def get_trending(
         .filter(Snapshot.period == time_window)
     )
     if language != "all":
-        base = base.filter(Repository.language == language.capitalize())
+        base = base.filter(func.lower(Repository.language) == cache_lang)
 
     total = base.count()
     rows = (
@@ -106,10 +116,13 @@ def get_trending(
         .all()
     )
     items = []
-    for idx, (repo, gained, score, _rank) in enumerate(rows, start=(page - 1) * limit + 1):
+    page_start = (page - 1) * limit + 1
+    for idx, (repo, gained, score, snap_rank) in enumerate(rows, start=page_start):
+        # 优先用快照回填的真实排名 (与缓存路径一致), 缺失时回退分页序号
+        rank = snap_rank if snap_rank is not None else idx
         items.append(
             TrendingItemOut(
-                rank=idx,
+                rank=rank,
                 repo=RepositoryOut.model_validate(repo),
                 delta_stars=int(gained or 0),
                 score=float(score or 0.0),

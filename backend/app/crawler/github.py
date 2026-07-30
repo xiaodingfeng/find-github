@@ -51,6 +51,10 @@ DEFAULT_TOP_LANGUAGES = [
     "Haskell", "Julia", "Zig", "Nim", "OCaml",
 ]
 
+# 低基数新秀查询的 star 阈值: 用于捞取低 star 但高增长的新仓库
+# (默认 sort=stars 会让 50★ 的新秀排在 10000★ 老仓库之后, 进不了前 1000)
+LOW_BASE_THRESHOLD = 3
+
 
 @dataclass
 class CrawlResult:
@@ -744,25 +748,39 @@ class GitHubSearchClient:
                 raise RuntimeError("用户手动停止抓取")
 
             # ===== Phase 1: 新秀榜 (created >= since) =====
-            logger.info("Phase 1: new repos created since %s", since)
-            base_new_query = build_candidate_query(threshold, language=None, since=since, mode="created")
-            result.queries_made += 1
-            async for item in self.search_one_query(client, base_new_query, cancel_check=cancel_check):
-                result.add_items([item])
-
-            for lang in languages:
-                if lang is None:
-                    continue
-                if cancel_check is not None and cancel_check():
-                    raise RuntimeError("用户手动停止抓取")
-                lang_new_query = build_candidate_query(threshold, language=lang, since=since, mode="created")
-                logger.info(
-                    "Phase 1 lang=%s (candidates so far: %d)",
-                    lang, len(result.items),
-                )
+            # monthly 跳过 created 维度 (30 天前创建的多为低 star 小仓库, 配额性价比低)
+            skip_created = period == "monthly"
+            if not skip_created:
+                logger.info("Phase 1: new repos created since %s", since)
+                base_new_query = build_candidate_query(threshold, language=None, since=since, mode="created")
                 result.queries_made += 1
-                async for item in self.search_one_query(client, lang_new_query, cancel_check=cancel_check):
+                async for item in self.search_one_query(client, base_new_query, cancel_check=cancel_check):
                     result.add_items([item])
+
+                # 低基数新秀榜: 降低 star 阈值, 捞取低 star 但高增长的新仓库
+                if threshold > LOW_BASE_THRESHOLD:
+                    low_base_query = build_candidate_query(
+                        LOW_BASE_THRESHOLD, language=None, since=since, mode="created"
+                    )
+                    result.queries_made += 1
+                    async for item in self.search_one_query(client, low_base_query, cancel_check=cancel_check):
+                        result.add_items([item])
+
+                for lang in languages:
+                    if lang is None:
+                        continue
+                    if cancel_check is not None and cancel_check():
+                        raise RuntimeError("用户手动停止抓取")
+                    lang_new_query = build_candidate_query(threshold, language=lang, since=since, mode="created")
+                    logger.info(
+                        "Phase 1 lang=%s (candidates so far: %d)",
+                        lang, len(result.items),
+                    )
+                    result.queries_made += 1
+                    async for item in self.search_one_query(client, lang_new_query, cancel_check=cancel_check):
+                        result.add_items([item])
+            else:
+                logger.info("Phase 1 skipped: monthly period, created dimension skipped")
 
             # ===== Phase 2: 活跃榜 (pushed >= since) =====
             logger.info("Phase 2: active repos pushed since %s", since)
@@ -881,18 +899,41 @@ class GitHubSearchClient:
 
             # ===== Phase 2: Search API 补充 (获取更多候选仓库) =====
             # 新秀榜 (created >= since): period 内创建的新仓库
-            logger.info("Phase 2: Search API supplement (created + pushed since %s)", since)
-            base_new_query = build_candidate_query(threshold, language=None, since=since, mode="created")
-            async for item in self.search_one_query(client, base_new_query, cancel_check=cancel_check):
-                gid = item.get("id")
-                if gid is None or gid in seen_ids:
-                    continue
-                seen_ids.add(gid)
-                yield item
-                count += 1
-                if count >= max_candidates:
-                    logger.info("Reached max_candidates=%d (phase 2 created), stopping", max_candidates)
-                    return
+            # monthly 跳过 created 维度 (30 天前创建的多为低 star 小仓库, 配额性价比低)
+            skip_created = period == "monthly"
+            logger.info(
+                "Phase 2: Search API supplement (created=%s, pushed since %s)",
+                "skip" if skip_created else "on", since,
+            )
+            if not skip_created:
+                base_new_query = build_candidate_query(threshold, language=None, since=since, mode="created")
+                async for item in self.search_one_query(client, base_new_query, cancel_check=cancel_check):
+                    gid = item.get("id")
+                    if gid is None or gid in seen_ids:
+                        continue
+                    seen_ids.add(gid)
+                    yield item
+                    count += 1
+                    if count >= max_candidates:
+                        logger.info("Reached max_candidates=%d (phase 2 created), stopping", max_candidates)
+                        return
+
+                # 低基数新秀榜: 降低 star 阈值, 捞取低 star 但高增长的新仓库
+                # (默认 sort=stars 会让 50★ 新秀排在 10000★ 老仓库之后, 进不了前 1000)
+                if threshold > LOW_BASE_THRESHOLD:
+                    low_base_query = build_candidate_query(
+                        LOW_BASE_THRESHOLD, language=None, since=since, mode="created"
+                    )
+                    async for item in self.search_one_query(client, low_base_query, cancel_check=cancel_check):
+                        gid = item.get("id")
+                        if gid is None or gid in seen_ids:
+                            continue
+                        seen_ids.add(gid)
+                        yield item
+                        count += 1
+                        if count >= max_candidates:
+                            logger.info("Reached max_candidates=%d (phase 2 low-base), stopping", max_candidates)
+                            return
 
             # 活跃榜 (pushed >= since): period 内有 push 的活跃仓库
             base_active_query = build_candidate_query(threshold, language=None, since=since, mode="pushed")
@@ -908,14 +949,29 @@ class GitHubSearchClient:
                     return
 
             # 按语言迭代查询 (突破 1000 条限制)
+            # 每个 lang 同时查 created + pushed, 覆盖非主流语言的活跃老仓库
             for lang in languages:
                 if lang is None:
                     continue
                 if cancel_check is not None and cancel_check():
                     raise RuntimeError("用户手动停止抓取")
                 logger.info("Phase 2 lang=%s (yielded so far: %d)", lang, count)
-                lang_new_query = build_candidate_query(threshold, language=lang, since=since, mode="created")
-                async for item in self.search_one_query(client, lang_new_query, cancel_check=cancel_check):
+                # 按语言 created (monthly 跳过)
+                if not skip_created:
+                    lang_new_query = build_candidate_query(threshold, language=lang, since=since, mode="created")
+                    async for item in self.search_one_query(client, lang_new_query, cancel_check=cancel_check):
+                        gid = item.get("id")
+                        if gid is None or gid in seen_ids:
+                            continue
+                        seen_ids.add(gid)
+                        yield item
+                        count += 1
+                        if count >= max_candidates:
+                            logger.info("Reached max_candidates=%d (phase 2 lang created), stopping", max_candidates)
+                            return
+                # 按语言 pushed (新增: 覆盖非主流语言的活跃老仓库)
+                lang_push_query = build_candidate_query(threshold, language=lang, since=since, mode="pushed")
+                async for item in self.search_one_query(client, lang_push_query, cancel_check=cancel_check):
                     gid = item.get("id")
                     if gid is None or gid in seen_ids:
                         continue
@@ -923,7 +979,7 @@ class GitHubSearchClient:
                     yield item
                     count += 1
                     if count >= max_candidates:
-                        logger.info("Reached max_candidates=%d (phase 2 lang), stopping", max_candidates)
+                        logger.info("Reached max_candidates=%d (phase 2 lang pushed), stopping", max_candidates)
                         return
 
         logger.info("Streaming crawl done: %d unique candidates yielded", count)

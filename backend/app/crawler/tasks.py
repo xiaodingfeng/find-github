@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from ..database import SessionLocal
-from ..models import CrawlRun, Repository, Snapshot, TrendingCache
+from ..models import CrawlRun, Repository, Snapshot, SnapshotMonthlySummary, TrendingCache
 from ..tz import now_cn, to_cn_datetime
 from .classifier import (
     classify_category,
@@ -33,7 +33,7 @@ from .classifier import (
     detect_efficiency_tool,
     detect_region_from_user,
 )
-from .github import GitHubSearchClient, compute_since_date
+from .github import DEFAULT_TOP_LANGUAGES, GitHubSearchClient, compute_since_date
 
 logger = logging.getLogger(__name__)
 
@@ -291,28 +291,45 @@ def _compute_stars_gained(
     Returns:
         (stars_gained, is_estimated): 新增量 和 是否为估算值
     """
-    # 查询同 period 的历史快照 (snapshot_date < today, 取最近一条)
+    period_days = PERIOD_DAYS.get(period, 7)
+
+    # 查询同 period 的历史快照: 取 period_days 天前 (或更早) 的最近一条.
+    # 关键: 必须查询 snapshot_date <= today - period_days, 而非 "最近一条".
+    # 因为 weekly/monthly 每天都写快照, "最近一条" = 昨天, 差值仅为 1 天增量,
+    # 而非该 period 真实的 7/30 天增量.
+    # daily: <= today-1 (昨天, 行为不变)
+    # weekly: <= today-7 (7 天前)
+    # monthly: <= today-30 (30 天前)
+    baseline_date = today - timedelta(days=period_days)
     prev_snap = (
         db.query(Snapshot)
         .filter(
             Snapshot.repository_id == repository.id,
             Snapshot.period == period,
-            Snapshot.snapshot_date < today,
+            Snapshot.snapshot_date <= baseline_date,
         )
         .order_by(Snapshot.snapshot_date.desc())
         .first()
     )
 
     if prev_snap is not None:
-        # 精确差值
-        gained = max(0, current_stars - (prev_snap.stars_at_snapshot or 0))
-        return gained, False
+        # 窗口校验: prev_snap 距 today 不得超过 period_days + 2 (容忍 1-2 天抓取空缺)
+        gap_days = (today - prev_snap.snapshot_date).days
+        if gap_days <= period_days + 2:
+            # 精确差值
+            gained = max(0, current_stars - (prev_snap.stars_at_snapshot or 0))
+            return gained, False
+        # 窗口异常 (历史快照太老), 降级估算
+        logger.warning(
+            "Snapshot window anomaly: repo=%s period=%s gap=%d days (expected ~%d), "
+            "falling back to estimation",
+            repository.full_name, period, gap_days, period_days,
+        )
 
-    # 无历史快照 (首次运行), 用仓库年龄 + 活跃度估算
+    # 无合格历史快照 (首次运行或窗口异常), 用仓库年龄 + 活跃度估算
     if not repository.created_at:
         return 0, True
 
-    period_days = PERIOD_DAYS.get(period, 7)
     # 仓库年龄天数
     if isinstance(repository.created_at, datetime):
         created = repository.created_at.date()
@@ -355,6 +372,10 @@ def _compute_stars_gained(
 # 时间衰减系数 λ: e^(-λ×AgeInDays)
 # λ=0.001 → 1年仓库因子0.69, 3年0.34, 5年0.16, 10年0.026
 SCORE_LAMBDA = 0.001
+# 低基数仓库惩罚阈值: total_stars < 此值时引入线性惩罚因子, 抑制刷星/营销号灌水
+SMALL_REPO_THRESHOLD = 50
+# age 衰减下限: 防止过度压制成熟基础设施项目 (5年→0.3, 10年→0.3 而非 0.026)
+AGE_FACTOR_FLOOR = 0.3
 
 
 def _compute_score(
@@ -365,19 +386,27 @@ def _compute_score(
 ) -> float:
     """计算热度评分.
 
-    Score = ΔStars × (1/log10(TotalStars+10)) × e^(-λ×AgeInDays)
+    Score = ΔStars × small_repo_penalty × (1/log10(TotalStars+10)) × age_factor
 
     - ΔStars: period 内新增 star (主要排序依据)
+    - small_repo_penalty: total_stars<50 时线性惩罚 (抑制刷星/营销号灌水),
+      10★→0.2, 49★→0.98, >=50★→1.0
     - 1/log10(TotalStars+10): 对高 Star 总量项目做惩罚, 提升低基数黑马权重
-    - e^(-λ×AgeInDays): 时间衰减, 鼓励新项目 (λ=0.001)
+    - age_factor: 时间衰减, 鼓励新项目 (λ=0.001), 下限 0.3 防止过度压制成熟项目
     """
     if stars_gained <= 0:
         return 0.0
 
+    # 低基数惩罚: total_stars<50 时线性衰减 (10★→0.2, 49★→0.98)
+    if total_stars < SMALL_REPO_THRESHOLD:
+        small_repo_penalty = total_stars / SMALL_REPO_THRESHOLD
+    else:
+        small_repo_penalty = 1.0
+
     # 对数惩罚: total_stars=100 → 0.5, 1000 → 0.33, 10000 → 0.25, 100000 → 0.2
     log_penalty = 1.0 / math.log10(total_stars + 10)
 
-    # 时间衰减
+    # 时间衰减 (下限 0.3: 5年仓库从 0.16 提升到 0.3, 10年从 0.026 提升到 0.3)
     age_days = 0
     if repository.created_at:
         if isinstance(repository.created_at, datetime):
@@ -385,13 +414,14 @@ def _compute_score(
         else:
             created = repository.created_at
         age_days = max(0, (today - created).days)
-    age_factor = math.exp(-SCORE_LAMBDA * age_days)
+    age_factor = max(AGE_FACTOR_FLOOR, math.exp(-SCORE_LAMBDA * age_days))
 
-    return round(stars_gained * log_penalty * age_factor, 4)
+    return round(stars_gained * small_repo_penalty * log_penalty * age_factor, 4)
 
 
-# 历史高分池: 刷新近 3 天有快照但本次未抓取的仓库, 兜底"老树开花"
-HISTORICAL_POOL_DAYS = 3
+# 历史高分池: 刷新近 7 天有快照但本次未抓取的仓库, 兜底"老树开花"
+# 窗口 7 天覆盖一个 weekly 周期, 避免爆发仓库因 3 天窗口过短而漏掉
+HISTORICAL_POOL_DAYS = 7
 HISTORICAL_POOL_TOP_N = 200
 
 
@@ -405,17 +435,19 @@ def _refresh_historical_pool(
     enriched: List[Tuple[Repository, int, float, bool]],
     cancel_event: threading.Event,
 ) -> List[Tuple[Repository, int, float, bool]]:
-    """刷新历史高分池: 近 3 天有快照但本次未抓取的仓库, 重新拉取最新数据.
+    """刷新历史高分池: 近 7 天有快照但本次未抓取的仓库, 重新拉取最新数据.
 
     兜底"老树开花"场景: 老仓库近期突然爆发, 但不在 created/pushed 的前 1000 条里.
     对这些仓库调用 /repos/{owner}/{repo} 获取最新 star 数, 重新计算 stars_gained + score.
 
-    限制: 最多刷新 Top 200 个 (按历史 stars_gained 降序), 控制 API 消耗.
+    限制: 最多刷新 Top 200 个 (按历史 score 降序, score 综合了增量+基数+年龄, 比纯
+    stars_gained 更稳定), 控制 API 消耗.
     """
     already_crawled_ids = {repo.id for repo, _, _, _ in enriched}
     since_date = today - timedelta(days=HISTORICAL_POOL_DAYS)
 
-    # 查询近 3 天有快照但本次未抓取的仓库, 按历史 stars_gained 降序取 Top N
+    # 查询近 7 天有快照但本次未抓取的仓库, 按历史 score 降序取 Top N
+    # (score 综合了增量+基数+年龄, 比纯 stars_gained 更稳定, 避免首次估算值干扰)
     rows = (
         db.query(Snapshot.repository_id, Snapshot.stars_gained)
         .filter(
@@ -423,7 +455,7 @@ def _refresh_historical_pool(
             Snapshot.snapshot_date < today,
             ~Snapshot.repository_id.in_(list(already_crawled_ids)) if already_crawled_ids else True,
         )
-        .order_by(Snapshot.stars_gained.desc())
+        .order_by(Snapshot.score.desc())
         .limit(HISTORICAL_POOL_TOP_N)
         .all()
     )
@@ -501,31 +533,198 @@ def _rebuild_trending_cache(
 ) -> None:
     """预计算 trending_cache: 按 score 排序写入缓存, 供 /api/v1/trending 高性能读取.
 
-    只写 language=all 的缓存 (按语言过滤由 API 实时查询, 因语言组合太多无法预计算).
+    写入两份缓存:
+    1. language="all": 全部 trending 仓库
+    2. 按 DEFAULT_TOP_LANGUAGES 分语言: 每个 language 一份缓存 (language 字段存小写)
+       覆盖热门语言, 避免按语言查询走实时 JOIN.
     """
-    # 清除该 period 的旧缓存
+    from ..config import settings
+
+    # 决定要预缓存的语言列表 (小写)
+    top_n = settings.GITHUB_CRAWL_TOP_LANGUAGES
+    cache_langs = {lang.lower() for lang in DEFAULT_TOP_LANGUAGES[:top_n]} if top_n > 0 else set()
+
+    # 清除该 period 的旧缓存 (all + 各语言)
     db.query(TrendingCache).filter(
         TrendingCache.time_window == period,
-        TrendingCache.language == "all",
     ).delete()
 
-    # 写入新缓存
+    now = now_cn()
+
+    # 1. 写入 language="all" 缓存
     for rank, (repo, gained, sc, _est) in enumerate(trending, start=1):
-        cache = TrendingCache(
+        db.add(TrendingCache(
             time_window=period,
             language="all",
             repository_id=repo.id,
             rank=rank,
             delta_stars=gained,
             score=sc,
-            calculated_at=now_cn(),
-        )
-        db.add(cache)
+            calculated_at=now,
+        ))
+
+    # 2. 按语言分组写入 (只对 cache_langs 中的语言)
+    # 按 repo.language.lower() 分组, 每组按 score 降序赋 rank
+    lang_groups: Dict[str, List[Tuple[Repository, int, float]]] = {}
+    for repo, gained, sc, _est in trending:
+        lang = (repo.language or "").lower()
+        if lang and lang in cache_langs:
+            lang_groups.setdefault(lang, []).append((repo, gained, sc))
+
+    for lang, group in lang_groups.items():
+        # 组内已按 score 降序 (trending 本身按 score 降序), 但分组后仍需重排以保证连续
+        group.sort(key=lambda x: x[2], reverse=True)
+        for rank, (repo, gained, sc) in enumerate(group, start=1):
+            db.add(TrendingCache(
+                time_window=period,
+                language=lang,
+                repository_id=repo.id,
+                rank=rank,
+                delta_stars=gained,
+                score=sc,
+                calculated_at=now,
+            ))
 
     db.commit()
+    lang_counts = {lang: len(g) for lang, g in lang_groups.items()}
     logger.info(
-        "Trending cache rebuilt: period=%s entries=%d", period, len(trending),
+        "Trending cache rebuilt: period=%s all=%d langs=%s",
+        period, len(trending), lang_counts,
     )
+
+
+def archive_old_snapshots(retention_days: Optional[int] = None) -> dict:
+    """归档超期快照: 将超过保留期的明细快照聚合成月度摘要后删除.
+
+    流程:
+    1. 查询 snapshot_date < today - retention_days 的快照
+    2. 按 (repository_id, period, year, month) 聚合:
+       - month_end_stars: 该月最后一次快照的 stars_at_snapshot
+       - max_stars_gained: 该月 stars_gained 最大值
+       - max_score: 该月 score 最大值
+       - snapshot_count: 该月快照条数
+    3. upsert 到 snapshot_monthly_summary (同月已存在则更新)
+    4. 删除已归档的明细快照
+
+    Args:
+        retention_days: 保留天数, 默认从 settings.SNAPSHOT_RETENTION_DAYS 读取
+
+    Returns:
+        归档统计: {archived_rows, summary_upserted, cutoff_date}
+    """
+    from ..config import settings
+
+    if retention_days is None:
+        retention_days = settings.SNAPSHOT_RETENTION_DAYS
+
+    today = now_cn().date()
+    cutoff_date = today - timedelta(days=retention_days)
+    db = SessionLocal()
+
+    try:
+        # 查询待归档的快照 (按 repository_id, period, year, month 分组聚合)
+        # SQLite 支持 strftime 提取年月
+        from sqlalchemy import func as _func
+
+        agg_rows = (
+            db.query(
+                Snapshot.repository_id.label("rid"),
+                Snapshot.period.label("period"),
+                _func.strftime("%Y", Snapshot.snapshot_date).label("yr"),
+                _func.strftime("%m", Snapshot.snapshot_date).label("mo"),
+                _func.count(Snapshot.id).label("cnt"),
+                _func.max(Snapshot.stars_gained).label("max_gained"),
+                _func.max(Snapshot.score).label("max_score"),
+            )
+            .filter(Snapshot.snapshot_date < cutoff_date)
+            .group_by(
+                Snapshot.repository_id,
+                Snapshot.period,
+                _func.strftime("%Y", Snapshot.snapshot_date),
+                _func.strftime("%m", Snapshot.snapshot_date),
+            )
+            .all()
+        )
+
+        if not agg_rows:
+            logger.info("Archive: no snapshots older than %s to archive", cutoff_date)
+            return {"archived_rows": 0, "summary_upserted": 0, "cutoff_date": str(cutoff_date)}
+
+        # 收集每个 (rid, period, year, month) 的月末 stars (该月最后一条快照的 stars_at_snapshot)
+        # 通过单独查询获取, 避免复杂子查询
+        summary_upserted = 0
+        for row in agg_rows:
+            year = int(row.yr)
+            month = int(row.mo)
+            # 查该月最后一条快照的 stars_at_snapshot
+            last_snap = (
+                db.query(Snapshot.stars_at_snapshot)
+                .filter(
+                    Snapshot.repository_id == row.rid,
+                    Snapshot.period == row.period,
+                    _func.strftime("%Y", Snapshot.snapshot_date) == row.yr,
+                    _func.strftime("%m", Snapshot.snapshot_date) == row.mo,
+                    Snapshot.snapshot_date < cutoff_date,
+                )
+                .order_by(Snapshot.snapshot_date.desc())
+                .first()
+            )
+            month_end_stars = last_snap[0] if last_snap else 0
+
+            # upsert 月度摘要 (同月已存在则更新)
+            existing = (
+                db.query(SnapshotMonthlySummary)
+                .filter(
+                    SnapshotMonthlySummary.repository_id == row.rid,
+                    SnapshotMonthlySummary.period == row.period,
+                    SnapshotMonthlySummary.year == year,
+                    SnapshotMonthlySummary.month == month,
+                )
+                .first()
+            )
+            if existing:
+                existing.month_end_stars = month_end_stars
+                existing.max_stars_gained = row.max_gained or 0
+                existing.max_score = row.max_score or 0.0
+                existing.snapshot_count = row.cnt
+            else:
+                db.add(SnapshotMonthlySummary(
+                    repository_id=row.rid,
+                    period=row.period,
+                    year=year,
+                    month=month,
+                    month_end_stars=month_end_stars,
+                    max_stars_gained=row.max_gained or 0,
+                    max_score=row.max_score or 0.0,
+                    snapshot_count=row.cnt,
+                ))
+            summary_upserted += 1
+
+        db.commit()
+
+        # 删除已归档的明细快照
+        deleted = (
+            db.query(Snapshot)
+            .filter(Snapshot.snapshot_date < cutoff_date)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+
+        logger.info(
+            "Archive done: cutoff=%s archived_rows=%d summary_upserted=%d",
+            cutoff_date, deleted, summary_upserted,
+        )
+        return {
+            "archived_rows": deleted,
+            "summary_upserted": summary_upserted,
+            "cutoff_date": str(cutoff_date),
+        }
+    except Exception as e:
+        db.rollback()
+        logger.exception("Archive failed: %s", e)
+        raise
+    finally:
+        db.close()
 
 
 def crawl_period(
@@ -533,6 +732,7 @@ def crawl_period(
     threshold: Optional[int] = None,
     languages: Optional[List[str]] = None,
     today: Optional[date] = None,
+    write_snapshot: bool = True,
 ) -> CrawlRunSummary:
     """抓取一个 period 的候选仓库并入库, 用快照差值法计算 stars_gained.
 
@@ -548,6 +748,8 @@ def crawl_period(
         threshold: star 新增阈值, 默认从 settings 读取
         languages: 显式指定语言列表, None 则按 settings 配置
         today: 用于测试注入日期
+        write_snapshot: 是否写快照. False 时仅刷新 Repository 表 (用于 daily 12:00 刷新,
+            避免覆盖 00:00 的差值基准), 跳过 stars_gained/score/快照/排名/缓存.
 
     Returns:
         CrawlRunSummary 摘要对象 (不持有 ORM 引用, 可安全传递)
@@ -567,6 +769,7 @@ def crawl_period(
             "threshold": threshold,
             "languages": languages,
             "top_languages_setting": settings.GITHUB_CRAWL_TOP_LANGUAGES,
+            "write_snapshot": write_snapshot,
         },
     )
     db.add(run)
@@ -626,41 +829,43 @@ def crawl_period(
                             _region_cache_put(owner, (region, is_cn))
                         _apply_region_to_repo(db, repo)
 
-                        # 3. 计算 stars_gained
-                        current_stars = item.get("stargazers_count", 0)
-                        # 优先使用 Trending 页面提供的真实增量 (非估算)
-                        page_gained = item.pop("_stars_gained_from_page", None)
-                        if page_gained is not None and page_gained > 0:
-                            gained = page_gained
-                            is_estimated = False
-                        else:
-                            gained, is_estimated = _compute_stars_gained(
-                                db, repo, period, today, current_stars
+                        if write_snapshot:
+                            # 3. 计算 stars_gained
+                            current_stars = item.get("stargazers_count", 0)
+                            # 优先使用 Trending 页面提供的真实增量 (非估算)
+                            page_gained = item.pop("_stars_gained_from_page", None)
+                            if page_gained is not None and page_gained > 0:
+                                gained = page_gained
+                                is_estimated = False
+                            else:
+                                gained, is_estimated = _compute_stars_gained(
+                                    db, repo, period, today, current_stars
+                                )
+
+                            # 3.5 计算热度评分 (Score)
+                            sc = _compute_score(repo, gained, current_stars, today)
+
+                            # 4. 写快照 (rank=None, 全部完成后回填)
+                            _add_snapshot(
+                                db,
+                                repo,
+                                period=period,
+                                snapshot_date=snapshot_date,
+                                crawl_run_id=run_id,
+                                rank_in_period=None,
+                                stars_gained=gained,
+                                score=sc,
                             )
 
-                        # 3.5 计算热度评分 (Score)
-                        sc = _compute_score(repo, gained, current_stars, today)
+                            db.commit()
 
-                        # 4. 写快照 (rank=None, 全部完成后回填)
-                        _add_snapshot(
-                            db,
-                            repo,
-                            period=period,
-                            snapshot_date=snapshot_date,
-                            crawl_run_id=run_id,
-                            rank_in_period=None,
-                            stars_gained=gained,
-                            score=sc,
-                        )
-
-                        db.commit()
+                            enriched.append((repo, gained, sc, is_estimated))
 
                         # 5. 更新 CrawlRun 进度 (前端可见实时进度)
                         run.total_repos_found = processed + 1
                         run.total_repos_upserted = processed + 1
                         db.commit()
 
-                        enriched.append((repo, gained, sc, is_estimated))
                         processed += 1
 
                         if processed % 10 == 0:
@@ -683,6 +888,26 @@ def crawl_period(
             return enriched
 
         enriched = asyncio.run(_stream_crawl_and_store())
+
+        if not write_snapshot:
+            # 刷新模式 (daily 12:00): 跳过历史池/排名/缓存, 直接收尾
+            logger.info(
+                "Crawl run #%d refresh-only done: %d repos updated (no snapshot written)",
+                run_id, len(enriched),
+            )
+            run = db.query(CrawlRun).get(run_id)
+            run.finished_at = now_cn()
+            run.status = "success"
+            run.total_repos_found = len(enriched)
+            run.total_repos_upserted = len(enriched)
+            db.commit()
+            return CrawlRunSummary(
+                run_id=run_id,
+                period=period,
+                status="success",
+                total_repos_found=len(enriched),
+                total_repos_upserted=len(enriched),
+            )
 
         # ===== Phase 3: 历史高分池 (近 3 天有快照但本次未抓取的仓库) =====
         # 兜底"老树开花": 老仓库近期突然爆发, 但不在 created/pushed 的前 1000 条里

@@ -1,6 +1,7 @@
 """CLI 入口: python -m cli crawl --period daily [--threshold 100]
             python -m cli initdb
             python -m cli server
+            python -m cli archive-snapshots [--retention-days 90]
 """
 
 from __future__ import annotations
@@ -130,6 +131,18 @@ def cmd_reclassify(args: argparse.Namespace) -> int:
         db.close()
 
 
+def cmd_archive(args: argparse.Namespace) -> int:
+    """归档超期快照: 将超过保留期的明细聚合成月度摘要后删除."""
+    from app.crawler.tasks import archive_old_snapshots
+
+    result = archive_old_snapshots(retention_days=args.retention_days)
+    print(
+        f"\nArchive finished. cutoff={result['cutoff_date']} "
+        f"archived_rows={result['archived_rows']} summary_upserted={result['summary_upserted']}"
+    )
+    return 0
+
+
 def cmd_hashpw(args: argparse.Namespace) -> int:
     """交互式生成管理员密码哈希, 输出可写入 .env 的 ADMIN_PASSWORD_HASH 值."""
     import getpass
@@ -194,6 +207,14 @@ def build_parser() -> argparse.ArgumentParser:
     # reclassify
     p_reclassify = sub.add_parser("reclassify", help="用最新规则重新分类所有已入库仓库")
     p_reclassify.set_defaults(func=cmd_reclassify)
+
+    # archive-snapshots
+    p_archive = sub.add_parser("archive-snapshots", help="归档超期快照 (聚合成月度摘要后删除)")
+    p_archive.add_argument(
+        "--retention-days", type=int, default=None,
+        help="保留天数 (默认读 settings.SNAPSHOT_RETENTION_DAYS=90)",
+    )
+    p_archive.set_defaults(func=cmd_archive)
 
     # hashpw
     p_hashpw = sub.add_parser("hashpw", help="生成管理员密码哈希 (ADMIN_PASSWORD_HASH)")

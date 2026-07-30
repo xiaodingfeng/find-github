@@ -20,12 +20,12 @@ find-github 是一个定时(每日 / 每周 / 每月)从 GitHub 发现热门仓�
   GitHub Trending 页面确保核心仓库 100% 匹配; 候选仓库上限 500 条 (`GITHUB_CRAWL_MAX_CANDIDATES`)。
 - **三档时段** — daily / weekly / monthly 各自独立抓取与快照; "全部"时段聚合
   三档去重列表。
-- **stars_gained 计算** — 优先使用快照差值法 (当前总 star − 历史 period 快照 star);
+- **stars_gained 计算** — 优先使用快照差值法 (当前总 star − `today - period_days` 那天的同 period 历史快照 star);
   首次运行无快照时按仓库年龄 + pushed_at 活跃度因子估算, 上限保护 (不超过总 star)。
   不依赖 stargazers API, 不受 fine-grained PAT 权限限制。
-- **热度评分排名** — Trending 榜单按 `Score = ΔStars × (1/log10(TotalStars+10)) × e^(-λ×AgeInDays)`
-  排序, 对高基数老牌项目做对数惩罚 + 时间衰减, 提升低基数黑马权重, 防止霸榜。
-- **历史高分池** — 兜底"老树开花": 刷新近 3 天有快照但本次未抓取的仓库 (Top 200),
+- **热度评分排名** — Trending 榜单按 `Score = ΔStars × small_repo_penalty × (1/log10(TotalStars+10)) × age_factor`
+  排序, 对高基数老牌项目做对数惩罚 + 时间衰减 (下限 0.3), 低基数仓库 (<50★) 线性惩罚抑制刷星, 防止霸榜。
+- **历史高分池** — 兜底"老树开花": 刷新近 7 天有快照但本次未抓取的仓库 (Top 200, 按历史 score 降序),
   重新拉取最新数据计算 stars_gained, 避免遗漏短期爆发的老仓库。
 - **历史快照** — 每次抓取写入 snapshots 表,用于绘制 star 趋势曲线。
 - **多维筛选** — 时段、语言、分类、地区、Star 范围、主题、许可证、关键词、行业等;
@@ -155,7 +155,7 @@ find-github/
 │   │       ├── interpreter.py   # AI 中文解读 (并行调用 LLM)
 │   │       ├── interpret_progress.py  # 全量解读进度跟踪 (进程内全局状态)
 │   │       └── classifier.py    # 技术分类/效率工具识别/中文文档检测/地区检测
-│   ├── cli.py                   # CLI 入口 (initdb/crawl/interpret/reclassify/hashpw/server)
+│   ├── cli.py                   # CLI 入口 (initdb/crawl/interpret/reclassify/archive-snapshots/hashpw/server)
 │   ├── requirements.txt
 │   ├── .env.example             # 配置模板
 │   └── .env                     # 实际配置 (含 token, 不提交)
@@ -282,8 +282,12 @@ AI 中文解读, 每个仓库保留最新一条.
 包含 summary_cn/value_prop/difficulty/learning_hours/suitable_for/alternatives/model.
 
 ### `trending_cache` 表
-Trending 榜单缓存, 按 (time_window, language, rank) 唯一, 预计算 Top N 写入,
-供 `/api/v1/trending` 高性能读取. 包含 rank/delta_stars/score/calculated_at.
+Trending 榜单缓存, 按 (time_window, language, rank) 唯一, 预计算 Top N 写入
+(`language=all` + 热门语言各一份), 供 `/api/v1/trending` 高性能读取. 包含 rank/delta_stars/score/calculated_at.
+
+### `snapshot_monthly_summary` 表
+快照月度摘要, 归档任务将超期 (默认 90 天) 明细快照按 (repository_id, period, year, month) 聚合后写入,
+保留月末总 star / 月内最大 stars_gained / 最大 score / 快照条数, 控制 snapshots 表大小.
 
 ---
 
@@ -295,12 +299,15 @@ Trending 榜单缓存, 按 (time_window, language, rank) 唯一, 预计算 Top N
 
 | 任务 | 执行时间 | 说明 |
 |------|----------|------|
-| daily | 每天 00:00 和 12:00 | 每 12 小时一次 |
-| weekly | 每天 00:30 | 每天写快照, stars_gained = 今天 − 7天前快照 |
-| monthly | 每天 01:00 | 每天写快照, stars_gained = 今天 − 30天前快照 |
+| daily | 每天 00:00 | 完整抓取, 写快照 (建立差值基准) |
+| daily_refresh | 每天 12:00 | 仅刷新 Repository 表, 不写快照 (避免覆盖 00:00 基准) |
+| weekly | 每天 02:00 | 每天写快照, stars_gained = 今天 − 7天前快照 |
+| monthly | 每天 04:00 | 每天写快照, stars_gained = 今天 − 30天前快照 |
+| archive_snapshots | 每天 03:00 | 将超期明细快照聚合成月度摘要后删除 (默认保留 90 天) |
 
-> 三个时段每天都会执行, 确保 stars_gained 使用精确快照差值而非估算, 数据更新及时.
-> 每次定时抓取成功后, 会自动对未解读仓库补跑 AI 解读 (force=False, 进度可在抓取记录页查看).
+> 三个时段每天都会执行, 确保 stars_gained 使用精确快照差值 (查询 `today - period_days` 那天的快照) 而非估算, 数据更新及时.
+> daily 12:00 为刷新模式, 仅更新仓库最新计数, 不写快照避免基准漂移.
+> 每次完整抓取成功后, 会自动对未解读仓库补跑 AI 解读 (force=False, 进度可在抓取记录页查看).
 
 ### 方案 B: 系统级 crontab
 
@@ -311,7 +318,9 @@ Trending 榜单缓存, 按 (time_window, language, rank) 唯一, 预计算 Top N
 ## ❓ 常见问题
 
 ### Q: stars_gained 是如何计算的?
-- 有历史快照: `stars_gained = 当前总star − 同period历史快照star` (精确差值)
+- 有合格历史快照: 查询 `snapshot_date <= today - period_days` 的同 period 历史快照,
+  `stars_gained = 当前总star − 历史快照star` (精确差值, 真实 N 天增量);
+  若历史快照窗口超出 `period_days + 2` 天则降级估算.
 - 首次运行无快照: 按仓库年龄估算 `total_stars / repo_age_days * period_days`,
   引入 pushed_at 活跃度因子, 上限不超过总 star
 

@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # 调度
     SCHEDULER_ENABLED: bool = True
 
+    # 快照归档: 超过此天数的明细快照会被聚合成月度摘要后删除 (控制 snapshots 表大小)
+    SNAPSHOT_RETENTION_DAYS: int = 90
+
     # CORS
     CORS_ORIGINS: str = "http://localhost:5173"
 

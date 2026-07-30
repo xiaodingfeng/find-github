@@ -189,3 +189,39 @@ class TrendingCache(Base):
 
     def __repr__(self) -> str:
         return f"<TrendingCache {self.time_window}/{self.language} #{self.rank} repo={self.repository_id}>"
+
+
+class SnapshotMonthlySummary(Base):
+    """快照月度摘要 - 归档任务将超过保留期的明细快照聚合后写入此表.
+
+    长期运行后 snapshots 表行数膨胀 (每天 ~1500 条), 归档任务将 N 天前的明细按
+    (repository_id, period, year, month) 聚合成月度摘要, 保留月末总 star、月内最大
+    stars_gained / score 与快照条数, 然后删除已归档的明细, 控制表大小.
+    """
+
+    __tablename__ = "snapshot_monthly_summary"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    repository_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    period: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    month: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 月末 (该月最后一次快照) 的总 star 数
+    month_end_stars: Mapped[int] = mapped_column(Integer, default=0)
+    # 该月内 stars_gained 的最大值
+    max_stars_gained: Mapped[int] = mapped_column(Integer, default=0)
+    # 该月内 score 的最大值
+    max_score: Mapped[float] = mapped_column(Float, default=0.0)
+    # 该月聚合的明细快照条数
+    snapshot_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "repository_id", "period", "year", "month", name="uq_repo_period_year_month"
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SnapshotMonthlySummary repo={self.repository_id} {self.period} {self.year}-{self.month}>"

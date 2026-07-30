@@ -9,11 +9,23 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from .config import settings
-from .crawler.tasks import crawl_period
+from .crawler.tasks import archive_old_snapshots, crawl_period
 
 logger = logging.getLogger(__name__)
 
 _scheduler: Optional[BackgroundScheduler] = None
+
+
+def _run_archive() -> None:
+    """APScheduler 任务回调 - 归档超期快照."""
+    try:
+        result = archive_old_snapshots()
+        logger.info(
+            "Scheduled archive done: archived_rows=%d summary_upserted=%d cutoff=%s",
+            result["archived_rows"], result["summary_upserted"], result["cutoff_date"],
+        )
+    except Exception:
+        logger.exception("Scheduled archive failed")
 
 
 def _sync_uninterpreted_after_crawl() -> None:
@@ -42,10 +54,15 @@ def _sync_uninterpreted_after_crawl() -> None:
         logger.exception("Post-crawl interpretation sync failed")
 
 
-def _run_crawl(period: str) -> None:
-    """APScheduler 任务回调 - 同步执行抓取, 成功后立即同步未解读仓库的 AI 解读."""
+def _run_crawl(period: str, write_snapshot: bool = True) -> None:
+    """APScheduler 任务回调 - 同步执行抓取, 成功后立即同步未解读仓库的 AI 解读.
+
+    Args:
+        period: daily / weekly / monthly
+        write_snapshot: False 时仅刷新 Repository 表不写快照 (daily 12:00 刷新模式)
+    """
     try:
-        summary = crawl_period(period=period)
+        summary = crawl_period(period=period, write_snapshot=write_snapshot)
     except Exception:
         logger.exception("Scheduled crawl failed: period=%s", period)
         return
@@ -54,6 +71,10 @@ def _run_crawl(period: str) -> None:
         logger.warning(
             "Scheduled crawl did not succeed (status=%s), skipping interpretation", summary.status,
         )
+        return
+
+    # 仅完整抓取 (写快照) 后才触发 AI 解读; 刷新模式不引入新解读任务
+    if not write_snapshot:
         return
 
     # 抓取成功后, 立即调用全量 AI 解读 (仅未解读的仓库)
@@ -68,35 +89,53 @@ def start_scheduler() -> BackgroundScheduler:
 
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 
-    # 每日抓取: 00:00 和 12:00 (每 12 小时, 让 stars_gained 增量更精确)
+    # 每日抓取: 00:00 完整抓取 (写快照, 建立差值基准)
     scheduler.add_job(
         _run_crawl,
-        trigger=CronTrigger(hour="0,12", minute=0),
+        trigger=CronTrigger(hour=0, minute=0),
         id="crawl_daily",
         args=["daily"],
+        kwargs={"write_snapshot": True},
         replace_existing=True,
     )
-    # 每周抓取: 每天 00:30 执行 (每天写快照, stars_gained = 今天 - 7天前快照)
+    # 每日刷新: 12:00 仅刷新 Repository 表 (不写快照, 避免覆盖 00:00 基准)
     scheduler.add_job(
         _run_crawl,
-        trigger=CronTrigger(hour=0, minute=30),
+        trigger=CronTrigger(hour=12, minute=0),
+        id="crawl_daily_refresh",
+        args=["daily"],
+        kwargs={"write_snapshot": False},
+        replace_existing=True,
+    )
+    # 每周抓取: 每天 02:00 执行 (每天写快照, stars_gained = 今天 - 7天前快照)
+    scheduler.add_job(
+        _run_crawl,
+        trigger=CronTrigger(hour=2, minute=0),
         id="crawl_weekly",
         args=["weekly"],
         replace_existing=True,
     )
-    # 每月抓取: 每天 01:00 执行 (每天写快照, stars_gained = 今天 - 30天前快照)
+    # 每月抓取: 每天 04:00 执行 (每天写快照, stars_gained = 今天 - 30天前快照)
     scheduler.add_job(
         _run_crawl,
-        trigger=CronTrigger(hour=1, minute=0),
+        trigger=CronTrigger(hour=4, minute=0),
         id="crawl_monthly",
         args=["monthly"],
+        replace_existing=True,
+    )
+    # 快照归档: 每天 03:00 将超期明细聚合成月度摘要后删除 (控制 snapshots 表大小)
+    scheduler.add_job(
+        _run_archive,
+        trigger=CronTrigger(hour=3, minute=0),
+        id="archive_snapshots",
         replace_existing=True,
     )
 
     scheduler.start()
     _scheduler = scheduler
     logger.info(
-        "APScheduler started. Jobs: crawl_daily(00:00,12:00), crawl_weekly(00:30 daily), crawl_monthly(01:00 daily)"
+        "APScheduler started. Jobs: crawl_daily(00:00 full), crawl_daily_refresh(12:00 refresh-only), "
+        "crawl_weekly(02:00 daily), crawl_monthly(04:00 daily), archive_snapshots(03:00 daily)"
     )
     return scheduler
 
