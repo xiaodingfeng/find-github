@@ -223,12 +223,18 @@ export default function RunsPage() {
     {
       title: '周期',
       dataIndex: 'period',
-      width: 80,
-      render: (p: Period) => (
-        <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
-          {periodLabel[p] ?? String(p)}
-        </span>
-      ),
+      width: 90,
+      render: (p: Period, record: CrawlRun) => {
+        const isRefresh = (record.params as Record<string, unknown> | null)?.write_snapshot === false;
+        return (
+          <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+            {periodLabel[p] ?? String(p)}
+            {isRefresh && (
+              <span style={{ color: 'var(--ochre-soft)', marginLeft: 4, fontSize: 10 }}>·刷新</span>
+            )}
+          </span>
+        );
+      },
     },
     {
       title: '状态',
@@ -266,17 +272,26 @@ export default function RunsPage() {
       title: '进度',
       width: 180,
       render: (_: unknown, record: CrawlRun) => {
+        const isRefresh = (record.params as Record<string, unknown> | null)?.write_snapshot === false;
         if (record.status === 'running') {
           const processed = record.total_repos_upserted ?? 0;
           return (
             <span className="mono" style={{ fontSize: 11, color: 'var(--sage)' }}>
-              已抓取 {processed}
+              {isRefresh ? '已刷新' : '已抓取'} {processed}
               <span style={{ color: 'var(--text-dim)', marginLeft: 8 }}>扫描中…</span>
             </span>
           );
         }
         const found = record.total_repos_found ?? 0;
         const upserted = record.total_repos_upserted ?? 0;
+        if (isRefresh) {
+          return (
+            <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              <span style={{ color: 'var(--ochre-soft)' }}>刷新 {upserted}</span>
+              <span style={{ color: 'var(--text-dim)', marginLeft: 6 }}>仓库</span>
+            </span>
+          );
+        }
         return (
           <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
             <span style={{ color: 'var(--slate)' }}>发现 {found}</span>
@@ -613,7 +628,7 @@ export default function RunsPage() {
 
       {/* ───────── RUNS TABLE ───────── */}
       <Card bodyStyle={{ padding: 0 }} className={`scatter-item ${shownReveal.has('table') ? 'is-shown' : ''}`} style={{ flex: 1, minHeight: 0 }}>
-        <div className={`list-fade ${loading && data ? 'list-fade-out' : ''}`}>
+        <div className="list-fade">
         <Table<CrawlRun>
           rowKey="id"
           loading={loading}
@@ -627,6 +642,7 @@ export default function RunsPage() {
             showSizeChanger: false,
             showQuickJumper: true,
             size: 'small',
+            onChange: () => window.scrollTo({ top: 0, behavior: 'smooth' }),
           }}
           columns={columns}
         />

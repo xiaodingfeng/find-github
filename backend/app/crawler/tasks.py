@@ -885,28 +885,28 @@ def crawl_period(
                 "Crawl run #%d streaming done: %d repos stored",
                 run_id, processed,
             )
-            return enriched
+            return enriched, processed
 
-        enriched = asyncio.run(_stream_crawl_and_store())
+        enriched, processed_count = asyncio.run(_stream_crawl_and_store())
 
         if not write_snapshot:
             # 刷新模式 (daily 12:00): 跳过历史池/排名/缓存, 直接收尾
             logger.info(
                 "Crawl run #%d refresh-only done: %d repos updated (no snapshot written)",
-                run_id, len(enriched),
+                run_id, processed_count,
             )
             run = db.query(CrawlRun).get(run_id)
             run.finished_at = now_cn()
             run.status = "success"
-            run.total_repos_found = len(enriched)
-            run.total_repos_upserted = len(enriched)
+            run.total_repos_found = processed_count
+            run.total_repos_upserted = processed_count
             db.commit()
             return CrawlRunSummary(
                 run_id=run_id,
                 period=period,
                 status="success",
-                total_repos_found=len(enriched),
-                total_repos_upserted=len(enriched),
+                total_repos_found=processed_count,
+                total_repos_upserted=processed_count,
             )
 
         # ===== Phase 3: 历史高分池 (近 3 天有快照但本次未抓取的仓库) =====

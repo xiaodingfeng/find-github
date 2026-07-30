@@ -94,6 +94,8 @@ export default function ReposPage(props: ReposPageProps) {
   const [onlyFav, setOnlyFav] = useState(false);
   const [interpLoadingIds, setInterpLoadingIds] = useState<Set<number>>(new Set());
   const firstRun = useRef(true);
+  // 分页切换后, 等数据加载完成再滚动到顶部 (避免在 loading 中途滚动)
+  const prevDataPage = useRef<number | null>(null);
   // entrance animation — random scatter reveal of toolbar / filters / trend / table
   const { shown: shownReveal } = useScatterReveal(
     ['toolbar', 'filters', 'trendStrip', 'table'],
@@ -199,6 +201,20 @@ export default function ReposPage(props: ReposPageProps) {
     filter.is_efficiency_tool,
     filter.industry,
   ]);
+
+  // 分页切换后, 等数据加载完成 (data.page 更新) 再滚动到顶部.
+  // 跳过首次加载 (null → page=1), 避免页面挂载时的额外滚动.
+  useEffect(() => {
+    if (!data) return;
+    if (prevDataPage.current === null) {
+      prevDataPage.current = data.page;
+      return;
+    }
+    if (prevDataPage.current !== data.page) {
+      prevDataPage.current = data.page;
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  }, [data?.page]);
 
   function updateFilter(patch: Record<string, string | number | undefined>) {
     const next = new URLSearchParams(searchParams);
@@ -633,7 +649,7 @@ export default function ReposPage(props: ReposPageProps) {
             </Space>
           </Col>
           <Col flex="auto">
-            <Input.Search
+            <Input
               size="small"
               value={qInput}
               onChange={(e) => setQInput(e.target.value)}
@@ -794,7 +810,7 @@ export default function ReposPage(props: ReposPageProps) {
       )}
 
       <Card bodyStyle={{ padding: 0 }} className={`scatter-item ${shownReveal.has('table') ? 'is-shown' : ''}`} style={{ flex: 1, minHeight: 0 }}>
-        <div className={`list-fade ${loading && data ? 'list-fade-out' : ''}`}>
+        <div className="list-fade">
         <Table<Repository>
           rowKey="id"
           loading={loading}
@@ -810,7 +826,9 @@ export default function ReposPage(props: ReposPageProps) {
             showTotal: (t) => `共 ${t} 条`,
             showQuickJumper: true,
             size: 'small',
-            onChange: (page, pageSize) => updateFilter({ page, per_page: pageSize }),
+            onChange: (page, pageSize) => {
+              updateFilter({ page, per_page: pageSize });
+            },
           }}
           onChange={handleTableChange}
           columns={columns}

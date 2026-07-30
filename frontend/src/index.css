@@ -1893,6 +1893,16 @@ a:hover {
 /* =====================================================================
    README OVERLAY — 占屏幕右半边, 固定悬浮在导航栏下方, 渐入渐出
    ===================================================================== */
+.readme-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 199;
+  background: transparent;
+  pointer-events: none;
+}
+.readme-backdrop.readme-backdrop-visible {
+  pointer-events: auto;
+}
 .readme-overlay {
   position: fixed;
   right: 0;
@@ -2040,19 +2050,22 @@ a:hover {
 .readme-content input[type="checkbox"] { accent-color: var(--accent); }
 
 /* =====================================================================
-   LIST FADE — fade out/in transition when list data refreshes
-   Applied to table/chart containers. list-fade-out fades content to
-   invisible during data fetch; removing it fades new content back in.
-   When combined with scatter-item (RadarPage), the compound selector
-   raises specificity above .scatter-item.is-shown so the fade-out wins.
+   LIST FADE — loading feedback for table refreshes.
+   antd Table loading overlay shows immediately on click; data swaps
+   in place when fetch completes. No blur/crossfade to avoid lag.
    ===================================================================== */
 .list-fade {
-  transition: opacity 240ms cubic-bezier(0.2, 0.7, 0.2, 1),
-              transform 240ms cubic-bezier(0.2, 0.7, 0.2, 1);
+  transition: opacity 160ms ease;
 }
-.list-fade-out {
-  opacity: 0;
-  transform: translateY(6px);
+
+/* antd Table loading overlay: lightweight, no blur on underlying data */
+.ant-spin-nested-loading > .ant-spin-container.ant-spin-blur {
+  opacity: 0.55;
+  pointer-events: none;
+}
+.ant-spin-nested-loading > .ant-spin {
+  background: rgba(252, 250, 254, 0.6) !important;
+  border-radius: var(--radius-lg);
 }
 /* scatter-item variant — must beat .scatter-item.is-shown (specificity 0,2,0) */
 .scatter-item.list-fade-out {

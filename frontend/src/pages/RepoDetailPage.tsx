@@ -287,6 +287,9 @@ export default function RepoDetailPage() {
         >
           <div className="eyebrow">
             § 档案 · {repo.owner}
+            <span style={{ marginLeft: 12, fontSize: 11, color: 'var(--text-dim)', fontWeight: 400 }}>
+              入库 {new Date(repo.first_seen_at).toLocaleDateString('zh-CN')}
+            </span>
           </div>
           <Button
             size="small"
@@ -536,6 +539,12 @@ export default function RepoDetailPage() {
 
       {/* README 弹框: 通过 Portal 渲染到 body, 脱离祖先 transform 影响, 保证 position: fixed 相对视口定位; 固定悬浮在导航栏下方, 顶部距导航栏底部 15px, 底部距屏幕底部 15px, 渐入渐出 */}
       {readmeMounted && createPortal(
+        <>
+        {/* 透明遮罩: 捕获 README 区域外的点击, 关闭弹框 */}
+        <div
+          className={`readme-backdrop ${readmeVisible ? 'readme-backdrop-visible' : ''}`}
+          onClick={handleCloseReadme}
+        />
         <div
           className={`readme-overlay ${readmeVisible ? 'readme-overlay-visible' : ''}`}
           style={{ top: `${readmeTop}px` }}
@@ -596,7 +605,8 @@ export default function RepoDetailPage() {
               />
             )}
           </div>
-        </div>,
+        </div>
+        </>,
         document.body,
       )}
     </div>

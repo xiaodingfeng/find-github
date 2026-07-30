@@ -429,7 +429,7 @@ export default function EfficiencyPage() {
       </div>
 
       <Card bodyStyle={{ padding: 0 }} className={`scatter-item ${shownReveal.has('table') ? 'is-shown' : ''}`} style={{ flex: 1, minHeight: 0 }}>
-        <div className={`list-fade ${loadingRepos && data ? 'list-fade-out' : ''}`}>
+        <div className="list-fade">
         <Table<Repository>
           rowKey="id"
           loading={loadingRepos}
@@ -444,6 +444,7 @@ export default function EfficiencyPage() {
             showTotal: (total) => `共 ${total} 条`,
             showQuickJumper: true,
             size: 'small',
+            onChange: () => window.scrollTo({ top: 0, behavior: 'smooth' }),
           }}
           columns={columns}
         />
