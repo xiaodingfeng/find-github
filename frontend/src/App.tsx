@@ -55,19 +55,9 @@ function App() {
 
   // load summary once (silent — used for the masthead stat line)
   useEffect(() => {
-    let alive = true;
     getSummary()
-      .then((s) => alive && setSummary(s))
+      .then((s) => setSummary(s))
       .catch(() => {});
-    const t = setInterval(() => {
-      getSummary()
-        .then((s) => alive && setSummary(s))
-        .catch(() => {});
-    }, 60000);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
   }, []);
 
   const selectedKey =
