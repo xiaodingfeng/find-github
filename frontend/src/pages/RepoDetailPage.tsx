@@ -216,13 +216,18 @@ export default function RepoDetailPage() {
     );
   }
 
-  const chartData = repo.snapshots
-    .slice()
-    .sort((a, b) => (a.snapshot_date < b.snapshot_date ? -1 : 1))
-    .map((s) => ({
-      date: s.snapshot_date,
-      [s.period]: s.stars_at_snapshot,
-    }));
+  // 按日期聚合快照数据：一个日期对应一个 chartData 项，包含 daily/weekly/monthly 三个字段
+  // 避免同一日期在 X 轴重复出现，保证三条线在同一日期垂直对齐
+  const chartData = Object.values(
+    repo.snapshots.reduce((acc, s) => {
+      const date = s.snapshot_date;
+      if (!acc[date]) {
+        acc[date] = { date };
+      }
+      acc[date][s.period] = s.stars_at_snapshot;
+      return acc;
+    }, {} as Record<string, { date: string; daily?: number; weekly?: number; monthly?: number }>)
+  ).sort((a, b) => (a.date < b.date ? -1 : 1));
 
   function handleFav() {
     const added = toggleFavorite(repo!.id);
