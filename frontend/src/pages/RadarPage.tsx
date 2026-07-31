@@ -12,6 +12,7 @@ import {
 } from 'recharts';
 import { getRadar, getCategoryStats } from '../api/client';
 import type { CategoryStat, Period, RadarPoint } from '../types';
+import { formatCompact } from '../utils';
 import { useScatterReveal } from '../hooks/useScatterReveal';
 
 // 分类中文映射
@@ -362,7 +363,7 @@ export default function RadarPage() {
             <div>
               <div className="label-mono">{metricLabel}</div>
               <div className="editorial-number" style={{ color: 'var(--accent)', fontSize: 54 }}>
-                {metricValue.toLocaleString()}
+                {formatCompact(metricValue)}
               </div>
             </div>
             <div style={{ height: 54, width: 1, background: 'var(--border)', alignSelf: 'center' }} />
@@ -402,15 +403,15 @@ export default function RadarPage() {
       <div className="metric-strip" style={{ marginBottom: 24 }}>
         <div>
           <div className="metric-label">总仓库</div>
-          <div className="metric-value metric-value-cyan">{totalRepos.toLocaleString()}</div>
+          <div className="metric-value metric-value-cyan">{formatCompact(totalRepos)}</div>
         </div>
         <div>
           <div className="metric-label">总 Star</div>
-          <div className="metric-value metric-value-amber">{totalStars.toLocaleString()}</div>
+          <div className="metric-value metric-value-amber">{formatCompact(totalStars)}</div>
         </div>
         <div>
           <div className="metric-label">新增 ★</div>
-          <div className="metric-value metric-value-hot">+{totalGained.toLocaleString()}</div>
+          <div className="metric-value metric-value-hot">+{formatCompact(totalGained)}</div>
         </div>
         <div>
           <div className="metric-label">分类数</div>

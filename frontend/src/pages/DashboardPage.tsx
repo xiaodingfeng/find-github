@@ -3,6 +3,7 @@ import { Card, Col, Row, Segmented, Space, Table, Tag, Typography, message } fro
 import { Tooltip as AntTooltip } from 'antd';
 import { RobotOutlined, RiseOutlined } from '@ant-design/icons';
 import { Link } from 'react-router-dom';
+import { formatCompact } from '../utils';
 import {
   PieChart,
   Pie,
@@ -335,8 +336,8 @@ export default function DashboardPage() {
               label="追踪仓库"
               color="var(--accent)"
               subs={[
-                { label: '总★', value: summary ? (summary.avg_stars * summary.total_repos).toLocaleString(undefined, { maximumFractionDigits: 0 }) : '—' },
-                { label: '均★', value: summary?.avg_stars?.toFixed(1) ?? '—' },
+                { label: '总★', value: summary ? formatCompact(summary.avg_stars * summary.total_repos) : '—' },
+                { label: '均★', value: summary ? formatCompact(summary.avg_stars) : '—' },
               ]}
             />
           </div>

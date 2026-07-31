@@ -21,6 +21,7 @@ import { RobotOutlined, StarFilled, StarOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import type { SortOrder } from 'antd/es/table/interface';
 import { Link, useSearchParams } from 'react-router-dom';
+import { formatCompact } from '../utils';
 import { getRepos, getLanguages, getFavorites, toggleFavorite, triggerInterpretSync } from '../api/client';
 import type { LanguageStat, Period, Repository, RepositoryList, SortField } from '../types';
 import Sparkline from '../components/Sparkline';
@@ -798,7 +799,7 @@ export default function ReposPage(props: ReposPageProps) {
                     color: tile.color,
                   }}
                 >
-                  {Number(tile.value).toLocaleString()}
+                  {formatCompact(Number(tile.value))}
                 </div>
               </div>
               {tile.series.length > 0 && (
