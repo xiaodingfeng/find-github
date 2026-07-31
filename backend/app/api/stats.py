@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, literal, or_
+from sqlalchemy import func, literal
 from sqlalchemy.orm import Session
 
 from ..tz import now_cn
@@ -254,30 +254,11 @@ def get_radar(
 ) -> List[RadarPointOut]:
     """技术雷达: 按技术分类聚合, 每类返回 top 仓库. 用于雷达图可视化.
 
-    优化: 一次性查出所有分类的最新快照 + 仓库, 在 Python 侧按分类分组取 top N,
-    避免对每个分类重复构建 latest_date_subq (原实现 11 分类 = 11 次相同子查询).
+    优化: 一次性查出所有分类的最新快照 + 仓库, 在 Python 侧按分类分组,
+    同时计算分类统计 (count/total_stars/total_stars_gained) 和 top N 仓库,
+    避免重复调用 get_category_stats 重复构建 latest_date_subq.
     """
-    cat_stats = get_category_stats(period=period, db=db)
-    if not cat_stats:
-        return []
-
-    # 取所有相关分类的仓库 + 最新快照, 一次性查询
-    categories = [cs.category for cs in cat_stats]
-    # 构造分类过滤条件: categories 可能包含 None (未分类仓库), 而 SQL 的
-    # `category IN (..., NULL)` 永远不会匹配 NULL 行, 会导致"其他/未分类"有数量但
-    # top_repos 为空. 这里拆成 IN(非空) + IS NULL 的 OR 组合.
-    non_null_cats = [c for c in categories if c is not None]
-    has_null_cat = any(c is None for c in categories)
-    cat_filter_parts = []
-    if non_null_cats:
-        cat_filter_parts.append(Repository.category.in_(non_null_cats))
-    if has_null_cat:
-        cat_filter_parts.append(Repository.category.is_(None))
-    cat_filter = or_(*cat_filter_parts) if cat_filter_parts else None
-
     if period:
-        # 用窗口函数对每个 (category) 按 stars_gained 降序排名, 取 top N
-        # SQLite 3.25+ 支持 ROW_NUMBER, 这里用相关子查询替代以兼容老版本
         latest_date_subq = (
             db.query(
                 Snapshot.repository_id.label("rid"),
@@ -301,8 +282,6 @@ def get_radar(
             )
             .filter(Snapshot.period == period)
         )
-        if cat_filter is not None:
-            q = q.filter(cat_filter)
         rows = q.order_by(Repository.category, Snapshot.stars_gained.desc()).all()
     else:
         q = (
@@ -312,32 +291,41 @@ def get_radar(
                 Repository.category.label("cat"),
             )
         )
-        if cat_filter is not None:
-            q = q.filter(cat_filter)
         rows = q.order_by(Repository.category, Repository.stargazers_count.desc()).all()
 
-    # 按 category 分组取 top N (rows 已按 (category, mv desc) 排序)
-    top_by_cat: dict = {}
+    # 按 category 分组: 一次遍历同时计算分类统计 + 取 top N
+    # rows 已按 (category, mv desc) 排序, 同 cat 连续
+    stats_by_cat: dict = {}
     for r, v, cat in rows:
-        bucket = top_by_cat.setdefault(cat, [])
-        if len(bucket) < top_per_category:
-            bucket.append((r, int(v)))
-        else:
-            # 已满, 由于 rows 按 cat 分组连续, 后续同 cat 可跳过
-            pass
+        bucket = stats_by_cat.setdefault(
+            cat,
+            {"count": 0, "total_stars": 0, "total_stars_gained": 0, "top": []},
+        )
+        bucket["count"] += 1
+        bucket["total_stars"] += r.stargazers_count or 0
+        bucket["total_stars_gained"] += int(v) if period else 0
+        if len(bucket["top"]) < top_per_category:
+            bucket["top"].append((r, int(v)))
+
+    # 按 count desc 排序 (与原 get_category_stats 行为一致)
+    sorted_cats = sorted(
+        stats_by_cat.items(),
+        key=lambda kv: kv[1]["count"],
+        reverse=True,
+    )
 
     result = []
-    for cs in cat_stats:
-        cat = cs.category
+    for cat, st in sorted_cats:
         cat_label = cat if cat is not None else "其他"
         top = [
             TopRepoOut(repo=RepositoryOut.model_validate(r), metric_value=v)
-            for r, v in top_by_cat.get(cat, [])
+            for r, v in st["top"]
         ]
         result.append(RadarPointOut(
             category=cat_label,
-            repos=cs.count,
-            stars_gained=cs.total_stars_gained,
+            repos=st["count"],
+            stars_gained=st["total_stars_gained"],
+            total_stars=st["total_stars"],
             top_repos=top,
         ))
     return result

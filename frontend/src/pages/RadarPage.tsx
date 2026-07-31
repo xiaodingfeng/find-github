@@ -10,8 +10,8 @@ import {
   ResponsiveContainer,
   Tooltip,
 } from 'recharts';
-import { getRadar, getCategoryStats } from '../api/client';
-import type { CategoryStat, Period, RadarPoint } from '../types';
+import { getRadar } from '../api/client';
+import type { Period, RadarPoint } from '../types';
 import { formatCompact } from '../utils';
 import { useScatterReveal } from '../hooks/useScatterReveal';
 
@@ -87,7 +87,6 @@ interface ChartPoint {
 export default function RadarPage() {
   const [period, setPeriod] = useState<Period>('weekly');
   const [radar, setRadar] = useState<RadarPoint[]>([]);
-  const [categoryStats, setCategoryStats] = useState<CategoryStat[]>([]);
   const [loading, setLoading] = useState(true);
   // entrance animation — random scatter reveal of toolbar / radar chart / cards
   const { shown: shownReveal } = useScatterReveal(
@@ -100,13 +99,9 @@ export default function RadarPage() {
     async function load() {
       setLoading(true);
       try {
-        const [r, c] = await Promise.all([
-          getRadar(period, 3),
-          getCategoryStats(period),
-        ]);
+        const r = await getRadar(period, 3);
         if (cancelled) return;
         setRadar(r);
-        setCategoryStats(c);
       } catch (e) {
         if (cancelled) return;
         message.error('加载技术雷达数据失败: ' + (e as Error).message);
@@ -124,17 +119,14 @@ export default function RadarPage() {
     () =>
       radar
         .map((rp) => {
-          const cs = categoryStats.find(
-            (c) => (c.category ?? null) === (rp.category ?? null),
-          );
-          const value = useTotalStars ? cs?.total_stars ?? 0 : rp.stars_gained;
+          const value = useTotalStars ? rp.total_stars : rp.stars_gained;
           return {
             category: categoryLabel(rp.category),
             rawCategory: rp.category,
             code: categoryCode(rp.category),
             repos: rp.repos,
             stars_gained: rp.stars_gained,
-            total_stars: cs?.total_stars ?? 0,
+            total_stars: rp.total_stars,
             value,
           };
         })
@@ -142,7 +134,7 @@ export default function RadarPage() {
           (a, b) =>
             categorySortIndex(a.rawCategory) - categorySortIndex(b.rawCategory),
         ),
-    [radar, categoryStats, useTotalStars],
+    [radar, useTotalStars],
   );
 
   const sortedRadar = useMemo(
@@ -155,15 +147,11 @@ export default function RadarPage() {
 
   const totalRepos = radar.reduce((s, r) => s + r.repos, 0);
   const totalGained = radar.reduce((s, r) => s + r.stars_gained, 0);
-  const totalStars = categoryStats.reduce((s, c) => s + c.total_stars, 0);
+  const totalStars = radar.reduce((s, r) => s + r.total_stars, 0);
   const topCategory = [...radar].sort(
     (a, b) =>
-      (useTotalStars
-        ? categoryStats.find((c) => c.category === a.category)?.total_stars ?? 0
-        : a.stars_gained) -
-      (useTotalStars
-        ? categoryStats.find((c) => c.category === b.category)?.total_stars ?? 0
-        : b.stars_gained),
+      (useTotalStars ? a.total_stars : a.stars_gained) -
+      (useTotalStars ? b.total_stars : b.stars_gained),
   )[0];
 
   if (loading && radar.length === 0) {
@@ -174,7 +162,7 @@ export default function RadarPage() {
   const metricValue = useTotalStars ? totalStars : totalGained;
   const topValue = topCategory
     ? useTotalStars
-      ? categoryStats.find((c) => c.category === topCategory.category)?.total_stars ?? 0
+      ? topCategory.total_stars
       : topCategory.stars_gained
     : 0;
 
@@ -484,14 +472,10 @@ export default function RadarPage() {
         >
           {sortedRadar.map((rp, idx) => {
             const color = categoryColor(rp.category);
-            const cs = categoryStats.find((c) => (c.category ?? null) === (rp.category ?? null));
-            const totalStarsCat = cs?.total_stars ?? 0;
-            const cardValue = useTotalStars ? totalStarsCat : rp.stars_gained;
+            const cardValue = useTotalStars ? rp.total_stars : rp.stars_gained;
             const maxValue = Math.max(
               ...sortedRadar.map((r) =>
-                useTotalStars
-                  ? categoryStats.find((c) => c.category === r.category)?.total_stars ?? 0
-                  : r.stars_gained,
+                useTotalStars ? r.total_stars : r.stars_gained,
               ),
               1,
             );

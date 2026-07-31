@@ -133,6 +133,7 @@ export interface RadarPoint {
   category: string;
   repos: number;
   stars_gained: number;
+  total_stars: number;
   top_repos: TopRepo[];
 }
 

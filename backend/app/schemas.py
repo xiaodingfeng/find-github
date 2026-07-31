@@ -174,6 +174,7 @@ class RadarPointOut(BaseModel):
     category: str
     repos: int
     stars_gained: int
+    total_stars: int
     top_repos: List[TopRepoOut]
 
 

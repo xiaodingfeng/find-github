@@ -170,6 +170,7 @@ export default function DashboardPage() {
     'charts', 'trending',
   ];
   const { shown, reveal } = useScatterReveal(DASHBOARD_IDS, 600);
+  const initialLoadDone = useRef(false);
 
   async function loadAll() {
     setLoading(true);
@@ -193,10 +194,12 @@ export default function DashboardPage() {
 
   useEffect(() => {
     loadAll();
+    initialLoadDone.current = true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    if (!initialLoadDone.current) return;
     setTrendLoading(true);
     getTopRepos(trendPeriod, 10, 'stars')
       .then(setTopRepos)
