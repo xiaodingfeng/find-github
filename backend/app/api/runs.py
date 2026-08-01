@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from ..database import SessionLocal, get_db
 from ..models import CrawlRun
 from ..schemas import CrawlRunListOut, CrawlRunOut, TriggerCrawlIn, TriggerCrawlOut
-from ..crawler.tasks import crawl_period, is_period_running, request_crawl_cancel
+from ..crawler.tasks import crawl_period, is_any_crawl_running, request_crawl_cancel
 from ..security import require_admin
 
 logger = logging.getLogger(__name__)
@@ -111,12 +111,13 @@ def _run_crawl_in_thread(period: str, threshold: Optional[int]) -> None:
 def trigger_crawl(payload: TriggerCrawlIn, _admin: None = Depends(require_admin)) -> TriggerCrawlOut:
     """手动触发一次抓取 (异步执行). 返回最新 running 状态的 run_id.
 
-    同一 period 已有抓取在运行时拒绝重复触发 (R5: 并发互斥).
+    跨 period 全局互斥: SQLite 单写者, 任意抓取在运行时拒绝新触发 (R5: 并发互斥),
+    避免 daily/weekly/monthly 并发写导致 'database is locked'.
     """
-    if is_period_running(payload.period):
+    if is_any_crawl_running():
         raise HTTPException(
             status_code=409,
-            detail=f"period={payload.period} 已有抓取任务在运行, 请等待完成或先停止.",
+            detail="已有抓取任务在运行, 请等待完成或先停止 (SQLite 不支持并发写)",
         )
     thread = threading.Thread(
         target=_run_crawl_in_thread,
@@ -145,6 +146,13 @@ def trigger_crawl(payload: TriggerCrawlIn, _admin: None = Depends(require_admin)
         finally:
             db.close()
 
+    # 2 秒内未出现 running 记录: 多半因并发竞争被 crawl_period 全局互斥跳过
+    # (trigger 检查与 crawl_period 注册之间存在毫秒级窗口, 极小概率并发)
+    if is_any_crawl_running():
+        raise HTTPException(
+            status_code=409,
+            detail="已有抓取任务在运行, 本次触发已跳过, 请等待当前任务完成后再试",
+        )
     return TriggerCrawlOut(
         run_id=0,
         status="started",

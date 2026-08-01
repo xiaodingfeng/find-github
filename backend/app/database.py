@@ -93,12 +93,36 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    """建表. 导入模型后调用 Base.metadata.create_all, 并补充缺失索引."""
+    """建表. 导入模型后调用 Base.metadata.create_all, 并补充缺失列与索引."""
     from . import models  # noqa: F401  确保模型被注册
 
     Base.metadata.create_all(bind=engine)
+    # 对已存在的表补加新列 (create_all 不会 ALTER 已有表, 需手动迁移)
+    _ensure_columns()
     # 对已存在的表补建索引 (CREATE INDEX IF NOT EXISTS 是幂等的)
     _ensure_indexes()
+
+
+def _ensure_columns() -> None:
+    """对已存在的表补加新列 (create_all 不会 ALTER 已有表).
+
+    项目无 Alembic, 新增字段通过此函数幂等迁移: 先 PRAGMA table_info 检查列是否存在,
+    不存在则 ALTER TABLE ADD COLUMN. 仅支持 SQLite (生产用 SQLite).
+    每次新增字段在此追加一个检查块, 保持向后兼容.
+    """
+    if not _IS_SQLITE:
+        return
+    # (表名, 列名, 列定义)
+    migrations = [
+        ("snapshots", "is_estimated", "BOOLEAN DEFAULT 0"),
+        ("trending_cache", "is_estimated", "BOOLEAN DEFAULT 0"),
+    ]
+    with engine.connect() as conn:
+        for table, column, coldef in migrations:
+            cols = [r[1] for r in conn.execute(text(f"PRAGMA table_info({table})"))]
+            if column not in cols:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}"))
+                conn.commit()
 
 
 def _ensure_indexes() -> None:

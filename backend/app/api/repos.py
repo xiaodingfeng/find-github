@@ -184,7 +184,11 @@ def _apply_filters(query, params: dict, skip_period: bool = False):
 
 
 def _attach_stars_gained(db: Session, repos: List[Repository], period: Optional[str]) -> dict:
-    """批量查询每个 repo 在指定 period 最新一天的 stars_gained. 返回 {repo_id: stars_gained}."""
+    """批量查询每个 repo 在指定 period 最新一天的 stars_gained.
+
+    Returns:
+        {repo_id: (stars_gained, is_estimated)} - 增量与是否估算值标记.
+    """
     if not repos or not period or period == "all":
         return {}
     repo_ids = [r.id for r in repos]
@@ -199,7 +203,7 @@ def _attach_stars_gained(db: Session, repos: List[Repository], period: Optional[
         .subquery()
     )
     rows = (
-        db.query(Snapshot.repository_id, Snapshot.stars_gained)
+        db.query(Snapshot.repository_id, Snapshot.stars_gained, Snapshot.is_estimated)
         .join(
             latest_date_subq,
             (latest_date_subq.c.rid == Snapshot.repository_id)
@@ -208,7 +212,7 @@ def _attach_stars_gained(db: Session, repos: List[Repository], period: Optional[
         .filter(Snapshot.period == period)
         .all()
     )
-    return {rid: gained for rid, gained in rows}
+    return {rid: (gained, bool(est)) for rid, gained, est in rows}
 
 
 def _attach_latest_interpretations(db: Session, repos: List[Repository]) -> dict:
@@ -381,7 +385,11 @@ def list_repos(
             )
             # 主查询: Repository join 最新快照, 按 stars_gained 排序
             base = (
-                db.query(Repository, Snapshot.stars_gained.label("gained_val"), Snapshot.score.label("score_val"))
+                db.query(
+                    Repository,
+                    Snapshot.stars_gained.label("gained_val"),
+                    Snapshot.is_estimated.label("est_val"),
+                )
                 .join(Snapshot, Snapshot.repository_id == Repository.id)
                 .join(
                     latest_date_subq,
@@ -400,13 +408,15 @@ def list_repos(
             base = base.order_by(desc(sort_col) if order == "desc" else asc(sort_col))
             rows = base.offset((page - 1) * per_page).limit(per_page).all()
             items = [r for r, _, _ in rows]
-            # 构造 (repo, stars_gained) 映射
-            gained_map = {r.id: int(g) for r, g, _ in rows}
+            # 构造 {repo_id: (stars_gained, is_estimated)} 映射
+            gained_map = {r.id: (int(g), bool(est)) for r, g, est in rows}
             interp_map = _attach_latest_interpretations(db, items)
             out_items = []
             for r in items:
                 ro = RepositoryOut.model_validate(r)
-                ro.stars_gained = gained_map.get(r.id)
+                gained, est = gained_map.get(r.id, (None, None))
+                ro.stars_gained = gained
+                ro.stars_gained_is_estimated = est
                 interp = interp_map.get(r.id)
                 if interp:
                     ro.latest_interpretation = AIInterpretationOut.model_validate(interp)
@@ -437,7 +447,9 @@ def list_repos(
     for r in items:
         ro = RepositoryOut.model_validate(r)
         if r.id in gained_map:
-            ro.stars_gained = gained_map[r.id]
+            gained, est = gained_map[r.id]
+            ro.stars_gained = gained
+            ro.stars_gained_is_estimated = est
         interp = interp_map.get(r.id)
         if interp:
             ro.latest_interpretation = AIInterpretationOut.model_validate(interp)

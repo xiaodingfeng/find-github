@@ -27,6 +27,7 @@ class SnapshotOut(BaseModel):
     forks_at_snapshot: int
     stars_gained: int = 0
     rank_in_period: Optional[int] = None
+    is_estimated: bool = False
     crawl_run_id: Optional[int] = None
 
 
@@ -77,6 +78,8 @@ class RepositoryOut(BaseModel):
     industry: Optional[str] = None
     # 列表场景附加字段 (按 period 最新快照计算, period=all 时为 None)
     stars_gained: Optional[int] = None
+    # stars_gained 是否为估算值 (首次运行无历史快照时走估算, 前端据此标记"估算"徽章)
+    stars_gained_is_estimated: Optional[bool] = None
     latest_interpretation: Optional[AIInterpretationOut] = None
 
 
@@ -153,6 +156,7 @@ class LanguageStatOut(BaseModel):
 class TopRepoOut(BaseModel):
     repo: RepositoryOut
     metric_value: int
+    is_estimated: bool = False
 
 
 class TimelinePointOut(BaseModel):
@@ -191,6 +195,7 @@ class TrendingItemOut(BaseModel):
     repo: RepositoryOut
     delta_stars: int
     score: float
+    is_estimated: bool = False
 
 
 class TrendingListOut(BaseModel):

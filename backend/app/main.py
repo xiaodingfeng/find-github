@@ -22,6 +22,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# httpx/httpcore 默认 INFO 会把每条 HTTP 请求都打日志 (抓取时数百条 /users/* /search/*),
+# 刷屏且无业务价值. 调到 WARNING 只记录失败请求. 业务进度日志 (app.crawler.tasks) 不受影响.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 

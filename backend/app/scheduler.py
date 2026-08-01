@@ -54,6 +54,29 @@ def _sync_uninterpreted_after_crawl() -> None:
         logger.exception("Post-crawl interpretation sync failed")
 
 
+def _sync_unclassified_after_crawl() -> None:
+    """抓取成功后, 对未分类仓库用 LLM 兜底分类.
+
+    仅补 category IS NULL 的仓库 (force=False), 避免对已分类仓库重复调用 LLM.
+    分类结果供 trending 去同质化 (优先级6) 使用. 本次抓取的新仓库若被规则分类器
+    漏掉, 此处补上 category, 下次构建 trending cache 时去同质化即可生效.
+    """
+    from .crawler.llm_classifier import classify_repos_with_llm
+
+    if not settings.llm_enabled:
+        logger.info("Post-crawl LLM classification skipped: LLM not enabled")
+        return
+
+    try:
+        result = classify_repos_with_llm(repo_ids=None, limit=200, force=False)
+        logger.info(
+            "Post-crawl LLM classification done: total=%d success=%d failed=%d",
+            result["total"], result["success"], result["failed"],
+        )
+    except Exception:
+        logger.exception("Post-crawl LLM classification failed")
+
+
 def _run_crawl(period: str, write_snapshot: bool = True) -> None:
     """APScheduler 任务回调 - 同步执行抓取, 成功后立即同步未解读仓库的 AI 解读.
 
@@ -77,6 +100,9 @@ def _run_crawl(period: str, write_snapshot: bool = True) -> None:
     if not write_snapshot:
         return
 
+    # 抓取成功后, 先用 LLM 兜底分类未分类仓库 (快, 限 200 个), 再全量 AI 解读.
+    # 分类结果供 trending 去同质化 (优先级6) 使用; 本次新仓库下次构建缓存时生效.
+    _sync_unclassified_after_crawl()
     # 抓取成功后, 立即调用全量 AI 解读 (仅未解读的仓库)
     _sync_uninterpreted_after_crawl()
 

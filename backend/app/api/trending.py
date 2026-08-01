@@ -67,6 +67,7 @@ def get_trending(
                 repo=RepositoryOut.model_validate(repo),
                 delta_stars=cache.delta_stars,
                 score=cache.score,
+                is_estimated=bool(cache.is_estimated),
             )
             for cache, repo in page_rows
         ]
@@ -96,7 +97,13 @@ def get_trending(
         .subquery()
     )
     base = (
-        db.query(Repository, Snapshot.stars_gained, Snapshot.score, Snapshot.rank_in_period)
+        db.query(
+            Repository,
+            Snapshot.stars_gained,
+            Snapshot.score,
+            Snapshot.rank_in_period,
+            Snapshot.is_estimated,
+        )
         .join(Snapshot, Snapshot.repository_id == Repository.id)
         .join(
             latest_date_subq,
@@ -117,7 +124,7 @@ def get_trending(
     )
     items = []
     page_start = (page - 1) * limit + 1
-    for idx, (repo, gained, score, snap_rank) in enumerate(rows, start=page_start):
+    for idx, (repo, gained, score, snap_rank, est) in enumerate(rows, start=page_start):
         # 优先用快照回填的真实排名 (与缓存路径一致), 缺失时回退分页序号
         rank = snap_rank if snap_rank is not None else idx
         items.append(
@@ -126,6 +133,7 @@ def get_trending(
                 repo=RepositoryOut.model_validate(repo),
                 delta_stars=int(gained or 0),
                 score=float(score or 0.0),
+                is_estimated=bool(est),
             )
         )
     return TrendingListOut(

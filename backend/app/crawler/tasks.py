@@ -22,12 +22,14 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..database import SessionLocal
 from ..models import CrawlRun, Repository, Snapshot, SnapshotMonthlySummary, TrendingCache
 from ..tz import now_cn, to_cn_datetime
 from .classifier import (
+    INDUSTRY_TO_CATEGORY_FALLBACK,
     classify_category,
     detect_chinese_doc,
     detect_efficiency_tool,
@@ -97,6 +99,17 @@ def is_period_running(period: str) -> bool:
         return period in _active_run_periods.values()
 
 
+def is_any_crawl_running() -> bool:
+    """检查是否已有任意 period 的抓取任务在运行 (跨 period 全局互斥).
+
+    SQLite 是单写者模型, WAL 模式下读读/读写可并发, 但写写仍串行.
+    两个 period 同时抓取会密集竞争写锁, busy_timeout 耗尽即 'database is locked'.
+    故全局只允许一个抓取任务运行, 手动/定时触发的并发请求均需让步.
+    """
+    with _active_runs_lock:
+        return bool(_active_run_periods)
+
+
 @dataclass
 class CrawlRunSummary:
     """抓取运行结果摘要 (避免 DetachedInstanceError, 不持有 ORM 对象)."""
@@ -139,6 +152,9 @@ def _upsert_repository(db: Session, item: Dict[str, Any]) -> Repository:
     # 自动分类 (技术领域 + 效率工具行业)
     category = classify_category(item)
     is_eff, industry = detect_efficiency_tool(item)
+    # fallback: 规则未命中 category 时, 按效率工具行业反推 (降低未分类率)
+    if category is None and is_eff and industry:
+        category = INDUSTRY_TO_CATEGORY_FALLBACK.get(industry)
     has_cn_doc = detect_chinese_doc(item)
 
     if repo is None:
@@ -246,8 +262,12 @@ def _add_snapshot(
     rank_in_period: Optional[int],
     stars_gained: int = 0,
     score: float = 0.0,
+    is_estimated: bool = False,
 ) -> None:
-    """为仓库插入一条快照 (若 (repo, period, date) 已存在则更新)."""
+    """为仓库插入一条快照 (若 (repo, period, date) 已存在则更新).
+
+    is_estimated 标记 stars_gained 是否为估算值 (首次运行无历史快照时走估算).
+    """
     existing = (
         db.query(Snapshot)
         .filter(
@@ -267,6 +287,7 @@ def _add_snapshot(
             stars_gained=stars_gained,
             score=score,
             rank_in_period=rank_in_period,
+            is_estimated=is_estimated,
             crawl_run_id=crawl_run_id,
         )
         db.add(snap)
@@ -276,6 +297,7 @@ def _add_snapshot(
         existing.stars_gained = stars_gained
         existing.score = score
         existing.rank_in_period = rank_in_period
+        existing.is_estimated = is_estimated
         existing.crawl_run_id = crawl_run_id
 
 
@@ -377,6 +399,29 @@ SMALL_REPO_THRESHOLD = 50
 # age 衰减下限: 防止过度压制成熟基础设施项目 (5年→0.3, 10年→0.3 而非 0.026)
 AGE_FACTOR_FLOOR = 0.3
 
+# ===== Trending 入榜门槛 (按 period 区分) =====
+# 不同 period 的 stars_gained 语义不同, 用统一 threshold 不合理:
+# daily 日增 10 已算有热度 (nushell/kafka/podman 日增 10 被旧门槛挡在榜外);
+# monthly 月增 10 形同虚设 (实测 319 条全 gained>100). 故按 period 分别设门槛.
+TRENDING_MIN_GAINED = {"daily": 3, "weekly": 15, "monthly": 50}
+
+# ===== Trending 榜去同质化 (分类配额) =====
+# monthly 等长周期榜单易被单一高增长类别 (如 ai) 霸榜. 写入 language="all" 缓存前,
+# 保证每个 category 至少有 N 个项目排在榜单靠前位置, 提升类别多样性.
+# 仅影响 rank 顺序, 不减少榜单总量; 分语言缓存不受影响 (分语言天然去同质化).
+DIVERSITY_PER_CATEGORY_MIN = 3
+
+# ===== 质量过滤 + 反作弊 (trending 入榜前过滤层) =====
+# 过滤只影响 trending 榜与 TrendingCache, 不影响 Snapshot 写入 (统计完整性保留).
+QUALITY_MIN_STARS = 20          # 总 star 硬下限: 排除 9★ 刷星仓
+QUALITY_MIN_DESC_LEN = 10       # 描述最短长度: 刷星仓多无描述或乱码
+SPAM_KEYWORDS = (               # 仓库名含这些词视为作弊/外挂/破解工具
+    "mod-menu", "cheat", "booster", "optimizer-2026",
+    "script-hub", "fps-booster", "hack", "crack", "keygen",
+)
+SPAM_OWNER_MIN_REPOS = 3        # 同 owner 近7天低star仓库数阈值 (批量刷星检测)
+SPAM_OWNER_MAX_STARS = 30       # "低star"定义: 低于此值计入批量刷星统计
+
 
 def _compute_score(
     repository: Repository,
@@ -386,13 +431,17 @@ def _compute_score(
 ) -> float:
     """计算热度评分.
 
-    Score = ΔStars × small_repo_penalty × (1/log10(TotalStars+10)) × age_factor
+    Score = ΔStars × small_repo_penalty × (1/log10(TotalStars+10)) × age_factor × (0.5 + growth_ratio)
 
     - ΔStars: period 内新增 star (主要排序依据)
     - small_repo_penalty: total_stars<50 时线性惩罚 (抑制刷星/营销号灌水),
       10★→0.2, 49★→0.98, >=50★→1.0
     - 1/log10(TotalStars+10): 对高 Star 总量项目做惩罚, 提升低基数黑马权重
     - age_factor: 时间衰减, 鼓励新项目 (λ=0.001), 下限 0.3 防止过度压制成熟项目
+    - growth_ratio: 增量占比 stars_gained/total_stars, 鼓励"相对高增长"而非"绝对高增长".
+      大仓库增量占比低 (384749★ gained 60016 → ratio 0.156 → factor 0.656),
+      小黑马占比高 (258★ gained 135 → ratio 0.52 → factor 1.02).
+      (0.5 + ratio) 范围 [0.5, 1.5], 温和调节不颠覆榜单. clamp 到 1.0 防估算值 gained>total.
     """
     if stars_gained <= 0:
         return 0.0
@@ -416,13 +465,65 @@ def _compute_score(
         age_days = max(0, (today - created).days)
     age_factor = max(AGE_FACTOR_FLOOR, math.exp(-SCORE_LAMBDA * age_days))
 
-    return round(stars_gained * small_repo_penalty * log_penalty * age_factor, 4)
+    # 增量占比因子: 鼓励"相对高增长"而非"绝对高增长", 抑制大仓库靠绝对增量霸榜.
+    # 384749★ gained 60016 → ratio 0.156 → factor 0.656; 258★ gained 135 → ratio 0.52 → factor 1.02
+    growth_ratio = min(1.0, stars_gained / max(total_stars, 1))
+    growth_factor = 0.5 + growth_ratio  # 范围 [0.5, 1.5]
+
+    return round(stars_gained * small_repo_penalty * log_penalty * age_factor * growth_factor, 4)
 
 
 # 历史高分池: 刷新近 7 天有快照但本次未抓取的仓库, 兜底"老树开花"
 # 窗口 7 天覆盖一个 weekly 周期, 避免爆发仓库因 3 天窗口过短而漏掉
 HISTORICAL_POOL_DAYS = 7
 HISTORICAL_POOL_TOP_N = 200
+
+
+def _compute_spam_owners(db: Session, repos: List[Repository], today: date) -> set:
+    """批量检测"同 owner 近期批量低 star 仓库"的刷星 owner 集合.
+
+    遍历 trending 候选的 owner, 一次性 GROUP BY 统计每个 owner 近 7 天新增且
+    stargazers_count < SPAM_OWNER_MAX_STARS 的仓库数, 达到 SPAM_OWNER_MIN_REPOS 即判刷星.
+    返回 owner login 集合, 供 _is_spam_repo 查询 (避免逐 repo N+1 查询).
+    """
+    owners = {r.owner for r in repos if r.owner and r.stargazers_count < SPAM_OWNER_MAX_STARS}
+    if not owners:
+        return set()
+
+    since = today - timedelta(days=7)
+    rows = (
+        db.query(Repository.owner)
+        .filter(
+            Repository.owner.in_(list(owners)),
+            Repository.stargazers_count < SPAM_OWNER_MAX_STARS,
+            Repository.first_seen_at >= since,
+        )
+        .group_by(Repository.owner)
+        .having(func.count(Repository.id) >= SPAM_OWNER_MIN_REPOS)
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
+def _is_spam_repo(repo: Repository, spam_owners: set) -> bool:
+    """判断仓库是否为刷星/作弊/低质内容, 应排除出 trending 榜.
+
+    判定规则 (任一命中即 True):
+    1. 总 star < QUALITY_MIN_STARS (9★ 刷星仓)
+    2. 描述长度 < QUALITY_MIN_DESC_LEN (刷星仓多无描述或乱码)
+    3. 仓库名含 SPAM_KEYWORDS (mod-menu/cheat/booster 等作弊外挂)
+    4. owner 在 spam_owners 集合中 (同 owner 近7天批量低 star 仓库)
+    """
+    if repo.stargazers_count < QUALITY_MIN_STARS:
+        return True
+    if len(repo.description or "") < QUALITY_MIN_DESC_LEN:
+        return True
+    full_name_lower = (repo.full_name or "").lower()
+    if any(kw in full_name_lower for kw in SPAM_KEYWORDS):
+        return True
+    if repo.owner in spam_owners:
+        return True
+    return False
 
 
 def _refresh_historical_pool(
@@ -492,7 +593,7 @@ def _refresh_historical_pool(
             _add_snapshot(
                 db, updated_repo, period=period, snapshot_date=snapshot_date,
                 crawl_run_id=run_id, rank_in_period=None,
-                stars_gained=gained, score=sc,
+                stars_gained=gained, score=sc, is_estimated=is_estimated,
             )
             db.commit()
             return (updated_repo, gained, sc, is_estimated)
@@ -525,6 +626,48 @@ def _refresh_historical_pool(
     return enriched
 
 
+def _diversify_trending(
+    trending: List[Tuple[Repository, int, float, bool]],
+    per_category_min: int,
+) -> List[Tuple[Repository, int, float, bool]]:
+    """分类配额去同质化: 保证每个 category 至少 per_category_min 个项目排在榜单靠前.
+
+    算法 (trending 入参已按 score 降序):
+    1. 按 category 分桶 (category 为 None 归入 "_uncategorized" 桶)
+    2. 第一轮: 每桶取 Top per_category_min 作为基底 (保证小类有曝光)
+    3. 第二轮: 剩余候选按 score 降序填充到末尾
+    4. 基底跨桶合并后按 score 降序, 填充继承原 score 降序
+    最终 = 基底 + 填充, rank 依次赋值. 靠前位置类别多样, 高分仍相对靠前.
+    不减少榜单总量, 仅重排顺序.
+    """
+    if not trending or per_category_min <= 0:
+        return trending
+
+    # 分桶 (trending 已按 score 降序, 每桶保持该顺序)
+    buckets: Dict[str, List[Tuple[Repository, int, float, bool]]] = {}
+    for item in trending:
+        cat = item[0].category or "_uncategorized"
+        buckets.setdefault(cat, []).append(item)
+
+    # 第一轮: 每桶取 Top per_category_min 作基底
+    base: List[Tuple[Repository, int, float, bool]] = []
+    selected_ids: set = set()
+    for items in buckets.values():
+        for item in items[:per_category_min]:
+            rid = item[0].id
+            if rid not in selected_ids:
+                base.append(item)
+                selected_ids.add(rid)
+
+    # 第二轮: 剩余候选填充 (继承 trending 原 score 降序顺序)
+    remaining = [item for item in trending if item[0].id not in selected_ids]
+
+    # 基底跨桶合并后按 score 降序 (让基底内高分项目仍靠前)
+    base.sort(key=lambda x: x[2], reverse=True)
+
+    return base + remaining
+
+
 def _rebuild_trending_cache(
     db: Session,
     period: str,
@@ -552,7 +695,11 @@ def _rebuild_trending_cache(
     now = now_cn()
 
     # 1. 写入 language="all" 缓存
-    for rank, (repo, gained, sc, _est) in enumerate(trending, start=1):
+    # 分类配额去同质化: 重排顺序使每个 category 至少 N 个排在靠前位置,
+    # 避免 monthly 等长周期榜单被单一高增长类别 (如 ai) 霸榜.
+    # 分语言缓存 (下方第 2 步) 保持原序, 分语言本身已天然去同质化.
+    diversified = _diversify_trending(trending, DIVERSITY_PER_CATEGORY_MIN)
+    for rank, (repo, gained, sc, est) in enumerate(diversified, start=1):
         db.add(TrendingCache(
             time_window=period,
             language="all",
@@ -560,21 +707,22 @@ def _rebuild_trending_cache(
             rank=rank,
             delta_stars=gained,
             score=sc,
+            is_estimated=est,
             calculated_at=now,
         ))
 
     # 2. 按语言分组写入 (只对 cache_langs 中的语言)
     # 按 repo.language.lower() 分组, 每组按 score 降序赋 rank
-    lang_groups: Dict[str, List[Tuple[Repository, int, float]]] = {}
-    for repo, gained, sc, _est in trending:
+    lang_groups: Dict[str, List[Tuple[Repository, int, float, bool]]] = {}
+    for repo, gained, sc, est in trending:
         lang = (repo.language or "").lower()
         if lang and lang in cache_langs:
-            lang_groups.setdefault(lang, []).append((repo, gained, sc))
+            lang_groups.setdefault(lang, []).append((repo, gained, sc, est))
 
     for lang, group in lang_groups.items():
         # 组内已按 score 降序 (trending 本身按 score 降序), 但分组后仍需重排以保证连续
         group.sort(key=lambda x: x[2], reverse=True)
-        for rank, (repo, gained, sc) in enumerate(group, start=1):
+        for rank, (repo, gained, sc, est) in enumerate(group, start=1):
             db.add(TrendingCache(
                 time_window=period,
                 language=lang,
@@ -582,14 +730,16 @@ def _rebuild_trending_cache(
                 rank=rank,
                 delta_stars=gained,
                 score=sc,
+                is_estimated=est,
                 calculated_at=now,
             ))
 
     db.commit()
     lang_counts = {lang: len(g) for lang, g in lang_groups.items()}
+    cat_count = len({(r.category or "_uncategorized") for r, _, _, _ in trending})
     logger.info(
-        "Trending cache rebuilt: period=%s all=%d langs=%s",
-        period, len(trending), lang_counts,
+        "Trending cache rebuilt: period=%s all=%d (diversified, %d categories) langs=%s",
+        period, len(trending), cat_count, lang_counts,
     )
 
 
@@ -761,25 +911,42 @@ def crawl_period(
     snapshot_date = today
 
     db = SessionLocal()
-    run = CrawlRun(
-        started_at=now_cn(),
-        period=period,
-        status="running",
-        params={
-            "threshold": threshold,
-            "languages": languages,
-            "top_languages_setting": settings.GITHUB_CRAWL_TOP_LANGUAGES,
-            "write_snapshot": write_snapshot,
-        },
-    )
-    db.add(run)
-    db.commit()
-    db.refresh(run)
-    run_id = run.id
-
-    # 注册取消事件
-    cancel_event = threading.Event()
+    # 全局互斥: SQLite 单写者, 不允许并发抓取. 检查+创建CrawlRun+注册 原子化,
+    # 避免两个 period 同时通过检查后并发写导致 'database is locked'.
     with _active_runs_lock:
+        if _active_run_periods:
+            db.close()
+            running_periods = list(_active_run_periods.values())
+            logger.warning(
+                "Crawl skipped (period=%s): another crawl is running (periods=%s)",
+                period, running_periods,
+            )
+            return CrawlRunSummary(
+                run_id=0,
+                period=period,
+                status="skipped",
+                total_repos_found=0,
+                total_repos_upserted=0,
+                error_message="已有抓取任务运行中, 本次跳过以避免 SQLite 写锁冲突",
+            )
+        run = CrawlRun(
+            started_at=now_cn(),
+            period=period,
+            status="running",
+            params={
+                "threshold": threshold,
+                "languages": languages,
+                "top_languages_setting": settings.GITHUB_CRAWL_TOP_LANGUAGES,
+                "write_snapshot": write_snapshot,
+            },
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        run_id = run.id
+
+        # 注册取消事件 (与上面的互斥检查同一把锁, 保证原子性)
+        cancel_event = threading.Event()
         _active_runs[run_id] = cancel_event
         _active_run_periods[run_id] = period
 
@@ -855,6 +1022,7 @@ def crawl_period(
                                 rank_in_period=None,
                                 stars_gained=gained,
                                 score=sc,
+                                is_estimated=is_estimated,
                             )
 
                             db.commit()
@@ -916,10 +1084,15 @@ def crawl_period(
         )
 
         # 全部入库完成, 现在按 score 计算 trending 排名并回填 rank_in_period
+        # 入榜门槛按 period 区分 (TRENDING_MIN_GAINED): daily 日增>3, weekly>15, monthly>50.
+        # 同时叠加质量过滤 (_is_spam_repo): 排除刷星/作弊/低质内容, 提升榜单"有用"纯度.
+        # 注意: 过滤只影响 trending 榜, 被排除的仓库 Snapshot 已写入, 统计完整性不受影响.
+        min_gained = TRENDING_MIN_GAINED.get(period, threshold)
+        spam_owners = _compute_spam_owners(db, [r for r, _, _, _ in enriched], today)
         trending = [
             (repo, gained, sc, est)
             for repo, gained, sc, est in enriched
-            if gained > threshold
+            if gained > min_gained and not _is_spam_repo(repo, spam_owners)
         ]
         # 按 score 降序排名 (而非 stars_gained, 防止老牌大项目霸榜)
         trending.sort(key=lambda x: x[2], reverse=True)

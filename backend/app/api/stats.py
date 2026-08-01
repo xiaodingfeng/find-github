@@ -136,7 +136,7 @@ def get_top_repos(
             .subquery()
         )
         rows = (
-            db.query(Repository, sort_col.label("metric_value"))
+            db.query(Repository, sort_col.label("metric_value"), Snapshot.is_estimated.label("est"))
             .join(Snapshot, Snapshot.repository_id == Repository.id)
             .join(
                 latest_date_subq,
@@ -156,15 +156,17 @@ def get_top_repos(
             .limit(limit)
             .all()
         )
-    repos = [r for r, _ in rows]
+    repos = [r for r, *_ in rows]
     interp_map = _attach_latest_interpretations(db, repos)
     out: List[TopRepoOut] = []
-    for r, v in rows:
+    for r, v, *rest in rows:
         ro = RepositoryOut.model_validate(r)
         interp = interp_map.get(r.id)
         if interp:
             ro.latest_interpretation = AIInterpretationOut.model_validate(interp)
-        out.append(TopRepoOut(repo=ro, metric_value=int(v)))
+        # period 模式查询带 is_estimated (rest[0]); 非 period 模式无此列, 默认 False
+        est = bool(rest[0]) if rest else False
+        out.append(TopRepoOut(repo=ro, metric_value=int(v), is_estimated=est))
     return out
 
 

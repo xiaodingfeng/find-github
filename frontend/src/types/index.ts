@@ -28,6 +28,8 @@ export interface Repository {
   industry: string | null;
   // 列表场景附加字段 (后端按 period 计算后返回)
   stars_gained?: number | null;
+  // stars_gained 是否为估算值 (首次运行无历史快照时走估算)
+  stars_gained_is_estimated?: boolean | null;
   latest_interpretation?: AIInterpretation | null;
 }
 
@@ -40,6 +42,7 @@ export interface Snapshot {
   forks_at_snapshot: number;
   stars_gained: number;
   rank_in_period: number | null;
+  is_estimated: boolean;
   crawl_run_id: number | null;
 }
 
@@ -114,6 +117,7 @@ export interface LanguageStat {
 export interface TopRepo {
   repo: Repository;
   metric_value: number;
+  is_estimated?: boolean;
 }
 
 export interface TimelinePoint {

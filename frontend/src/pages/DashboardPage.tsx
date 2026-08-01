@@ -670,7 +670,7 @@ export default function DashboardPage() {
               width: 110,
               dataIndex: 'metric_value',
               sorter: (a: TopRepo, b: TopRepo) => a.metric_value - b.metric_value,
-              render: (v: number) => (
+              render: (v: number, record: TopRepo) => (
                 <span
                   className="display"
                   style={{
@@ -681,6 +681,11 @@ export default function DashboardPage() {
                     textShadow: '0 0 12px rgba(240, 136, 62, 0.4)',
                   }}
                 >
+                  {record.is_estimated && (
+                    <AntTooltip title="首次抓取无历史快照, 增量为估算值, 系统运行满一个周期后自动转精确">
+                      <span style={{ fontSize: 11, color: 'var(--text-dim)', marginRight: 3, fontWeight: 400 }}>约</span>
+                    </AntTooltip>
+                  )}
                   +{v.toLocaleString()}
                 </span>
               ),

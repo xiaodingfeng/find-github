@@ -192,6 +192,7 @@ function App() {
             borderTop: '1px solid var(--border)',
             background: 'rgba(255, 255, 255, 0.5)',
             backdropFilter: 'blur(12px)',
+            zIndex: -1,
           }}
         >
           <div

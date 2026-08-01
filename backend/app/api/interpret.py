@@ -116,6 +116,26 @@ def trigger_interpret_all(_admin: None = Depends(require_admin)) -> InterpretRes
     )
 
 
+@router.post("/classify", response_model=InterpretResultOut)
+def trigger_classify(payload: InterpretRequestIn, _admin: None = Depends(require_admin)) -> InterpretResultOut:
+    """用 LLM 对未分类仓库兜底分类 (同步执行, 适合小批量).
+
+    - 不传 repo_ids: 自动选 category IS NULL 的仓库 (按 star 降序)
+    - force=true: 强制重新分类 (忽略已有 category)
+    """
+    if not settings.llm_enabled:
+        return InterpretResultOut(total=0, success=0, failed=0)
+
+    from ..crawler.llm_classifier import classify_repos_with_llm
+
+    result = classify_repos_with_llm(
+        repo_ids=payload.repo_ids,
+        limit=payload.limit,
+        force=payload.force,
+    )
+    return InterpretResultOut(**result)
+
+
 @router.get("/progress")
 def get_progress() -> dict:
     """查询全量 AI 解读进度."""

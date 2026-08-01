@@ -165,7 +165,10 @@ export default function RunsPage() {
       message.success(res.message);
       setTimeout(load, 500);
     } catch (e) {
-      message.error('触发失败: ' + (e as Error).message);
+      // 提取后端 HTTPException 的 detail (如 409 "已有抓取任务在运行") 给出友好提示
+      const err = e as { response?: { data?: { detail?: string } }; message?: string };
+      const detail = err.response?.data?.detail;
+      message.error(detail ? `触发失败: ${detail}` : '触发失败: ' + (err.message ?? String(e)));
     } finally {
       setTriggering(false);
     }

@@ -42,21 +42,40 @@ CATEGORY_RULES = [
     ("devops", {
         "topics": {"devops", "kubernetes", "docker", "container", "ci-cd", "terraform",
                    "ansible", "helm", "observability", "monitoring", "infrastructure",
-                   "cloud-native", "serverless", "k8s"},
+                   "cloud-native", "serverless", "k8s",
+                   "argo", "argocd", "cilium", "istio", "prometheus", "grafana",
+                   "vault", "envoy", "linkerd", "opentelemetry", "jaeger", "trivy",
+                   "falco", "crossplane", "knative", "tekton", "k3s", "k0s",
+                   "opa", "gatekeeper", "containerd", "podman", "buildah", "skaffold",
+                   "helm-chart", "pulumi", "packer", "nomad", "consul"},
         "desc_kw": ["运维", "容器", "kubernetes", "docker", "devops", "基础设施",
-                    "ci/cd", "监控", "云原生"],
+                    "ci/cd", "监控", "云原生", "prometheus", "grafana", "istio",
+                    "服务网格", "可观测性", "链路追踪", "argo", "容器编排"],
         "languages": set(),
     }),
     ("security", {
         "topics": {"security", "pentesting", "vulnerability", "cve", "exploit",
-                   "cryptography", "encryption", "red-team", "blue-team", "siem"},
-        "desc_kw": ["安全", "漏洞", "渗透", "加密", "security", "pentest", "crypto"],
+                   "cryptography", "encryption", "red-team", "blue-team", "siem",
+                   "waf", "ids", "ips", "firewall", "reverse-engineering",
+                   "malware", "antivirus", "yara", "suricata", "snort", "osquery",
+                   "appsec", "devsecops", "zero-trust", "soar", "edr", "xdr",
+                   "secret-scanning", "sast", "dast", "dependency-check"},
+        "desc_kw": ["安全", "漏洞", "渗透", "加密", "security", "pentest", "crypto",
+                    "waf", "防火墙", "入侵检测", "逆向", "恶意软件", "杀毒",
+                    "应用安全", "devsecops", "零信任"],
         "languages": set(),
     }),
     ("database", {
         "topics": {"database", "sql", "nosql", "redis", "postgresql", "mysql",
-                   "mongodb", "sqlite", "vector-database", "olap", "oltp"},
-        "desc_kw": ["数据库", "database", "sql", "向量数据库", "kv 存储"],
+                   "mongodb", "sqlite", "vector-database", "olap", "oltp",
+                   "clickhouse", "duckdb", "tikv", "tidb", "cockroachdb", "supabase",
+                   "surrealdb", "neon", "planetscale", "prisma", "drizzle-orm",
+                   "sqlalchemy", "orm", "query-builder", "leveldb", "rocksdb",
+                   "influxdb", "timescaledb", "cassandra", "elasticsearch",
+                   "opensearch", "dynamodb", "etcd", "consul"},
+        "desc_kw": ["数据库", "database", "sql", "向量数据库", "kv 存储",
+                    "clickhouse", "duckdb", "tidb", "cockroachdb", "时序数据库",
+                    "orm", "数据迁移", "连接池"],
         "languages": set(),
     }),
     ("mobile", {
@@ -72,8 +91,15 @@ CATEGORY_RULES = [
     }),
     ("data", {
         "topics": {"data-engineering", "data-science", "etl", "data-pipeline",
-                   "pandas", "spark", "hadoop", "airflow", "jupyter"},
-        "desc_kw": ["数据工程", "data science", "etl", "数据分析", "数据管道"],
+                   "pandas", "spark", "hadoop", "airflow", "jupyter",
+                   "dbt", "dagster", "prefect", "polars", "dvc",
+                   "great-expectations", "delta-lake", "iceberg", "hudi",
+                   "data-quality", "data-lineage", "feature-store", "jupyterlab",
+                   "notebook", "dataset", "data-warehouse", "data-lake", "lakehouse",
+                   "streaming", "kafka", "flink", "beam"},
+        "desc_kw": ["数据工程", "data science", "etl", "数据分析", "数据管道",
+                    "dbt", "dagster", "数据仓库", "数据湖", "特征工程",
+                    "数据血缘", "数据质量", "流处理"],
         "languages": set(),
     }),
     ("blockchain", {
@@ -247,6 +273,25 @@ INDUSTRY_RULES = [
                     "课程", "背单词", "记忆", "mooc"],
     }),
 ]
+
+# ===== 行业 → 技术领域 反推映射 (classify_category 规则未命中时的 fallback) =====
+# 当 topics/desc/language 全未命中 CATEGORY_RULES, 但 detect_efficiency_tool 识别出
+# industry 时, 按行业反推一个合理的 category, 降低未分类率 (400 个 → 目标 <5%).
+INDUSTRY_TO_CATEGORY_FALLBACK = {
+    "ai-assistant": "ai",      # AI 助手 → ai
+    "data": "data",            # 数据分析 → data
+    "design": "frontend",      # 设计工具 → frontend
+    "media": "frontend",       # 媒体处理 → frontend (多为前端展示/编辑)
+    "developer": "backend",    # 开发者工具 → backend (GitHub 上多为后端/CLI)
+    "office": "backend",       # 办公工具 → backend
+    "writing": "frontend",     # 写作工具 → frontend (笔记/编辑器)
+    "pm": "backend",           # 项目管理 → backend
+    "operation": "backend",    # 运营自动化 → backend
+    "marketing": "backend",    # 营销工具 → backend
+    "finance": "backend",      # 财务工具 → backend
+    "education": "backend",    # 教育工具 → backend
+}
+
 
 # ===== 中文文档检测关键词 =====
 CHINESE_KEYWORDS = [

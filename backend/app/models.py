@@ -95,6 +95,9 @@ class Snapshot(Base):
     # 用于防止老牌大项目霸榜, 提升低基数爆款黑马权重
     score: Mapped[Optional[float]] = mapped_column(Float, default=0.0)
     rank_in_period: Mapped[Optional[int]] = mapped_column(Integer)
+    # stars_gained 是否为估算值 (首次运行无历史快照时走估算, 系统跑满一个 period 后自动转精确)
+    # 前端据此标记"估算"徽章, weekly 榜首周约 80% 为估算值
+    is_estimated: Mapped[bool] = mapped_column(Boolean, default=False)
     crawl_run_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("crawl_runs.id", ondelete="SET NULL"), index=True
     )
@@ -179,6 +182,8 @@ class TrendingCache(Base):
     rank: Mapped[int] = mapped_column(Integer, nullable=False)
     delta_stars: Mapped[int] = mapped_column(Integer, default=0)
     score: Mapped[float] = mapped_column(Float, default=0.0)
+    # 对应 Snapshot.is_estimated, 缓存命中时也能返回估算标记 (不丢失透明度)
+    is_estimated: Mapped[bool] = mapped_column(Boolean, default=False)
     calculated_at: Mapped[datetime] = mapped_column(DateTime, default=now_cn, index=True)
 
     repository: Mapped["Repository"] = relationship("Repository")

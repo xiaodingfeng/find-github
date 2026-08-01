@@ -467,6 +467,9 @@ export default function ReposPage(props: ReposPageProps) {
                       display: 'inline-block',
                     }}
                   >
+                    {record.stars_gained_is_estimated && (
+                      <span style={{ fontSize: 10, color: 'var(--text-dim)', marginRight: 2, fontWeight: 400 }}>约</span>
+                    )}
                     +{v.toLocaleString()}
                   </span>
                   {isHot && <span className="hot-badge" style={{ marginLeft: 6, padding: '1px 5px', fontSize: 9 }}>HOT</span>}

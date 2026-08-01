@@ -22,6 +22,11 @@ def setup_logging(verbose: bool = False) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # httpx 每条 HTTP 请求都打 INFO 日志, 抓取时刷屏. 非 verbose 模式调到 WARNING;
+    # verbose (DEBUG) 模式保留, 便于调试网络请求.
+    if not verbose:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def cmd_initdb(args: argparse.Namespace) -> int:
@@ -73,6 +78,22 @@ def cmd_interpret(args: argparse.Namespace) -> int:
     )
     print(
         f"\nInterpretation finished. total={result['total']} "
+        f"success={result['success']} failed={result['failed']}"
+    )
+    return 0 if result["failed"] == 0 else 1
+
+
+def cmd_classify_llm(args: argparse.Namespace) -> int:
+    """用 LLM 对未分类仓库兜底分类 (category/industry)."""
+    from app.crawler.llm_classifier import classify_repos_with_llm
+
+    result = classify_repos_with_llm(
+        repo_ids=None,
+        limit=args.limit,
+        force=args.force,
+    )
+    print(
+        f"\nLLM classification finished. total={result['total']} "
         f"success={result['success']} failed={result['failed']}"
     )
     return 0 if result["failed"] == 0 else 1
@@ -203,6 +224,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_interp.add_argument("--limit", type=int, default=50, help="最多处理仓库数")
     p_interp.add_argument("--force", action="store_true", help="强制重新生成")
     p_interp.set_defaults(func=cmd_interpret)
+
+    # classify-llm
+    p_clf = sub.add_parser("classify-llm", help="用 LLM 对未分类仓库兜底分类")
+    p_clf.add_argument("--limit", type=int, default=400, help="最多处理仓库数")
+    p_clf.add_argument("--force", action="store_true", help="强制重新分类 (忽略已有 category)")
+    p_clf.set_defaults(func=cmd_classify_llm)
 
     # reclassify
     p_reclassify = sub.add_parser("reclassify", help="用最新规则重新分类所有已入库仓库")
